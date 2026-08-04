@@ -1,5 +1,5 @@
 ﻿```markdown
-# drift-check 🔎
+# drift-check 
 
 **drift-check** is an experimental CLI tool that detects API signature mismatches between your Python codebase and your installed dependencies. 
 
@@ -51,20 +51,19 @@ This tool is in active development. Please report edge cases!
 
 **Supported:**
 
-* ✅ Dynamic runtime signature inspection
-* ✅ Automatic `.venv` detection
-* ✅ Unpacking modern `TypedDict` type-hints (e.g., OpenAI SDK)
-* ✅ Standard library filtering
+*  Dynamic runtime signature inspection
+*  Automatic `.venv` detection
+*  Unpacking modern `TypedDict` type-hints (e.g., OpenAI SDK)
+*  Standard library filtering
 
 **Known Limitations (v0.1.0):**
 
-* ⚠️ **Instantiated Variables:** Currently struggles to trace methods called on class instances (e.g., `app.post` in FastAPI).
-* ⚠️ **Dynamic Kwargs:** Cannot statically verify parameters passed dynamically via `**kwargs` at the call site.
+*  **Instantiated Variables:** Currently struggles to trace methods called on class instances (e.g., `app.post` in FastAPI).
+*  **Dynamic Kwargs:** Cannot statically verify parameters passed dynamically via `**kwargs` at the call site.
 
 ## License
 
 MIT
 
 ```
-
 ```
