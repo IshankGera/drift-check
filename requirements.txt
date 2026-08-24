@@ -1,3 +1,4 @@
 ﻿openai==1.50.0
 requests>=2.31
 stripe
+mock-sdk==1.0.0

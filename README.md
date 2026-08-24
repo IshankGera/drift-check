@@ -1,69 +1,102 @@
 ﻿```markdown
-# drift-check 
+# drift-check 🔎
 
-**drift-check** is an experimental CLI tool that detects API signature mismatches between your Python codebase and your installed dependencies. 
+**Stop guessing if a dependency upgrade will break your Python code.**
 
-If you've ever upgraded a package (like OpenAI, FastAPI, or Pydantic) only to have your app crash at runtime because a parameter was renamed or removed, `drift-check` is built to catch that *before* you run your code.
+Upgrading Python packages in a large or legacy codebase often feels like a gamble. Will moving a dependency to a new major version break everything? `drift-check` is an experimental CLI tool that analyzes your code against a **future** dependency version *before* you actually upgrade.
 
-## How It Works
-Instead of executing your application, `drift-check` uses an AST (Abstract Syntax Tree) to read your function calls, spins up a secure subprocess inside your project's `.venv`, and dynamically validates your arguments against the actual signatures of your installed packages.
+Instead of generic linting, `drift-check` spins up an isolated sandbox, extracts the new API signatures, and reports exactly which lines of your codebase will break if you apply the upgrade.
 
-## Installation
+## 🚀 How It Works
+
+1. **Baseline Verification:** Parses your `requirements.txt` and active `.venv` to mathematically prove your current environment is stable.
+2. **PyPI Resolution:** Validates and normalizes your target version (e.g., resolving `15` to `15.0.0` automatically).
+3. **Targeted Sandboxing:** Uses `uv` to silently spin up a temporary virtual environment containing the future target package.
+4. **AST Intersection Analysis:** Reads your Python files without executing them, identifying only the API calls your code actually makes, and cross-references them against the target sandbox.
+5. **CI/CD Ready:** Exits with code `1` if breaking changes are found, blocking bad dependency updates from merging.
+
+## 📦 Installation
 
 Install globally via `uv` (recommended):
 ```bash
-uv tool install drift-check
+uv tool install py-drift-check
 
 ```
 
 Or via pip:
 
 ```bash
-pip install drift-check
+pip install py-drift-check
 
 ```
 
-## Quickstart
+## 💻 Quickstart
 
-Navigate to any Python project and run:
+Navigate to your Python project directory and run the `upgrade` command:
 
 ```bash
-drift-check run .
+# Check if upgrading 'openai' to v1.52.0 will break your current code
+drift-check upgrade openai --to 1.52.0
 
 ```
 
-## Example Output
+### Testing Internal or Unpublished Packages
+
+If you are developing an internal SDK or a private package, you can bypass PyPI entirely and analyze your code against a local `.whl` file:
+
+```bash
+drift-check upgrade mock-sdk --to 2.0.0 --local-wheel ./dist/mock_sdk-2.0.0-py3-none-any.whl
+
+```
+
+## 📊 Example Output
+
+`drift-check` intentionally ignores new features in the target version to filter out noise, strictly reporting **actionable breaking changes**:
 
 ```text
-┏━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ Status     ┃ Location           ┃ Package  ┃ Message                                             ┃
-┡━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-│ ❌ ERROR   │ main.py:19         │ openai   │ Unknown parameter passed: 'model_name'              │
-│ ⚠ WARN     │ database.py:42     │ asyncpg  │ Unable to verify forwarded keyword argument         │
-│ ✓ OK       │ router.py:12       │ httpx    │ All parameters valid.                               │
-└────────────┴────────────────────┴──────────┴─────────────────────────────────────────────────────┘
+Starting Upgrade Analysis for openai -> 1.52.0...
+Verifying environment baseline...
+✓ Baseline established: openai == 1.45.0
+
+Resolving target version '1.52.0' on PyPI...
+✓ Target resolved: 1.52.0
+
+Building isolated sandbox for openai==1.52.0...
+Scanning codebase for API calls...
+
+Drift Check Results:
+┏━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Status     ┃ Location      ┃ Package  ┃ Message                                                 ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ❌ ERROR   │ service.py:42 │ openai   │ Parameter 'max_tokens' is no longer supported.          │
+│ ❌ ERROR   │ test_api.py:8 │ openai   │ Method 'old_method' no longer exists in target version. │
+│ ⚠ WARN     │ router.py:12  │ openai   │ Target API uses dynamic **kwargs. (Confidence: LOW)     │
+└────────────┴───────────────┴──────────┴─────────────────────────────────────────────────────────┘
+
+Build Failed: Incompatible API calls detected in target version.
 
 ```
 
-## Features & Current Limitations (v0.1.0)
+## ⚠️ Features & Current Limitations (v0.2.0)
 
-This tool is in active development. Please report edge cases!
+This tool is in active development.
 
-**Supported:**
+**Supported Features:**
 
-*  Dynamic runtime signature inspection
-*  Automatic `.venv` detection
-*  Unpacking modern `TypedDict` type-hints (e.g., OpenAI SDK)
-*  Standard library filtering
+* Strict environment baseline enforcement.
+* PyPI fallback resolution prompts.
+* Unpacking modern `TypedDict` and `Unpack` type-hints for strict kwargs evaluation.
+* Seamless `uv` sandbox management.
+* Local `.whl` file bypass support.
 
-**Known Limitations (v0.1.0):**
+**Known Limitations:**
 
-*  **Instantiated Variables:** Currently struggles to trace methods called on class instances (e.g., `app.post` in FastAPI).
-*  **Dynamic Kwargs:** Cannot statically verify parameters passed dynamically via `**kwargs` at the call site.
+* **Dependency Files:** Currently only supports reading baselines from `requirements.txt` (support for `pyproject.toml` and `uv.lock` is planned).
+* **Variable Inference:** Currently struggles to trace methods called on complex instantiated variables across multiple files (e.g., `app.post` in FastAPI frameworks).
+* **Dynamic Kwargs:** Cannot statically verify dynamic arguments passed at the call site (e.g., `client.create(**my_dict)`).
 
 ## License
 
 MIT
 
-```
 ```

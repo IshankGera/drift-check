@@ -12,7 +12,7 @@ from drift_check.models import SignatureDefinition
 
 # The inline worker now handles both standard signatures and TypedDicts securely in the target environment
 INLINE_WORKER = """
-import sys, json, importlib, inspect, typing
+import sys, json, importlib, inspect, typing , os
 sys.path.insert(0, os.getcwd())
 
 SDK_REGISTRY = {
@@ -124,10 +124,14 @@ class StubProvider:
         return None
 
 class SignatureResolver:
-    def __init__(self, project_python_exec: str, target_version: Optional[str] = None, package_to_sandbox: Optional[str] = None):
+    def __init__(self, project_python_exec: str, target_version: Optional[str] = None, package_to_sandbox: Optional[str] = None, local_wheel: Optional[str]=None):
         self.project_python_exec = project_python_exec
         self.target_version = target_version
         self.package_to_sandbox = package_to_sandbox
+        
+        # FIX: Convert the relative wheel path to an absolute path immediately
+        self.local_wheel = os.path.abspath(local_wheel) if local_wheel else None
+        
         self.sandbox_dir = None
         self.sandbox_python_exec = None
         
@@ -146,10 +150,13 @@ class SignatureResolver:
         
         self.sandbox_python_exec = os.path.join(path, ".venv", "Scripts", "python.exe") if os.name == 'nt' else os.path.join(path, ".venv", "bin", "python")
             
-        # 2. Install the package explicitly using the sandbox's python executable
-        # This strictly binds the installation to the sandbox, ignoring host environments
+        # 2. Determine installation target
+        # If a local wheel is provided, install that file. Otherwise, pull from PyPI.
+        install_target = self.local_wheel if self.local_wheel else f"{self.package_to_sandbox}=={self.target_version}"
+        
+        # 3. Install into the sandbox
         subprocess.run(
-            ["uv", "pip", "install", "--python", self.sandbox_python_exec, f"{self.package_to_sandbox}=={self.target_version}"],
+            ["uv", "pip", "install", "--python", self.sandbox_python_exec, install_target],
             cwd=path, check=True, capture_output=True
         )
 
