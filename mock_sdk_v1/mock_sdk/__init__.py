@@ -1,3 +1,3 @@
-from .client import Client
+from .client import Client, unchanged_method , old_method
 
-__all__ = ["Client"]
+__all__ = ["Client", "unchanged_method" , "old_method"]

@@ -69,23 +69,42 @@ def main():
         print(json.dumps({"status": "METHOD_NOT_FOUND"}))
     except ValueError:
         print(json.dumps({"status": "SIGNATURE_UNAVAILABLE"}))
-    except Exception:
-        print(json.dumps({"status": "UNSUPPORTED_CALLABLE"}))
+    except Exception as e:
+        print(json.dumps({
+            "status": "UNSUPPORTED_CALLABLE",
+            "error": repr(e)
+        }))
 
 if __name__ == '__main__':
     main()
 """
 
 class RuntimeProvider:
-    """Executes signature inspection securely within the target environment."""
     def resolve(self, python_exec: str, package_name: str, method_name: str) -> dict:
         result = subprocess.run(
             [python_exec, "-c", INLINE_WORKER, package_name, method_name],
-            capture_output=True, text=True
+            capture_output=True,
+            text=True
         )
+
+        if result.returncode != 0:
+            print("\n--- RUNTIME WORKER ERROR ---")
+            print("Python:", python_exec)
+            print("Package:", package_name)
+            print("Method:", method_name)
+            print("STDOUT:", result.stdout)
+            print("STDERR:", result.stderr)
+            print("----------------------------\n")
+
+            return {"status": "UNSUPPORTED_CALLABLE"}
+
         try:
             return json.loads(result.stdout.strip())
         except json.JSONDecodeError:
+            print("\n--- INVALID WORKER OUTPUT ---")
+            print(result.stdout)
+            print("-----------------------------\n")
+
             return {"status": "UNSUPPORTED_CALLABLE"}
 
 class StubProvider:
@@ -161,10 +180,27 @@ class SignatureResolver:
         )
 
     def resolve(self, package_name: str, method_name: str) -> SignatureDefinition:
-        target_exec = self.sandbox_python_exec if (self.sandbox_dir and package_name == self.package_to_sandbox) else self.project_python_exec
+        target_exec = (
+            self.sandbox_python_exec
+            if (
+                self.sandbox_dir
+                and package_name.replace("-", "_").lower()
+                == self.package_to_sandbox.replace("-", "_").lower()
+            )
+            else self.project_python_exec
+        )
+
+        print("\n--- SIGNATURE DEBUG ---")
+        print("Package:", package_name)
+        print("Method:", method_name)
+        print("Project Python:", self.project_python_exec)
+        print("Sandbox Python:", self.sandbox_python_exec)
+        print("Selected Python:", target_exec)
+        print("-----------------------\n")
         
         # 1. Run dynamic worker in the target environment
         data = self.runtime_provider.resolve(target_exec, package_name, method_name)
+        print("WORKER RESULT:", data)
         status = data.get("status", "UNSUPPORTED_CALLABLE")
         
         if status == "SUCCESS":

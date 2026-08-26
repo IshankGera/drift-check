@@ -1,17 +1,5 @@
-from mock_sdk import Client
+import mock_sdk
 
-
-client = Client()
-
-
-def test_create():
-    result = client.create(
-        name="test",
-        old_param="something"
-    )
-
-    print(result)
-
-
-if __name__ == "__main__":
-    test_create()
+mock_sdk.old_method()
+client = mock_sdk.Client()
+client.create(name="test", old_param="hello")
