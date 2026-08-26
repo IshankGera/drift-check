@@ -12,7 +12,7 @@ from drift_check.models import SignatureDefinition
 
 # The inline worker now handles both standard signatures and TypedDicts securely in the target environment
 INLINE_WORKER = """
-import sys, json, importlib, inspect, typing
+import sys, json, importlib, inspect, typing , os
 sys.path.insert(0, os.getcwd())
 
 SDK_REGISTRY = {
@@ -69,23 +69,42 @@ def main():
         print(json.dumps({"status": "METHOD_NOT_FOUND"}))
     except ValueError:
         print(json.dumps({"status": "SIGNATURE_UNAVAILABLE"}))
-    except Exception:
-        print(json.dumps({"status": "UNSUPPORTED_CALLABLE"}))
+    except Exception as e:
+        print(json.dumps({
+            "status": "UNSUPPORTED_CALLABLE",
+            "error": repr(e)
+        }))
 
 if __name__ == '__main__':
     main()
 """
 
 class RuntimeProvider:
-    """Executes signature inspection securely within the target environment."""
     def resolve(self, python_exec: str, package_name: str, method_name: str) -> dict:
         result = subprocess.run(
             [python_exec, "-c", INLINE_WORKER, package_name, method_name],
-            capture_output=True, text=True
+            capture_output=True,
+            text=True
         )
+
+        if result.returncode != 0:
+            print("\n--- RUNTIME WORKER ERROR ---")
+            print("Python:", python_exec)
+            print("Package:", package_name)
+            print("Method:", method_name)
+            print("STDOUT:", result.stdout)
+            print("STDERR:", result.stderr)
+            print("----------------------------\n")
+
+            return {"status": "UNSUPPORTED_CALLABLE"}
+
         try:
             return json.loads(result.stdout.strip())
         except json.JSONDecodeError:
+            print("\n--- INVALID WORKER OUTPUT ---")
+            print(result.stdout)
+            print("-----------------------------\n")
+
             return {"status": "UNSUPPORTED_CALLABLE"}
 
 class StubProvider:
@@ -124,10 +143,14 @@ class StubProvider:
         return None
 
 class SignatureResolver:
-    def __init__(self, project_python_exec: str, target_version: Optional[str] = None, package_to_sandbox: Optional[str] = None):
+    def __init__(self, project_python_exec: str, target_version: Optional[str] = None, package_to_sandbox: Optional[str] = None, local_wheel: Optional[str]=None):
         self.project_python_exec = project_python_exec
         self.target_version = target_version
         self.package_to_sandbox = package_to_sandbox
+        
+        # FIX: Convert the relative wheel path to an absolute path immediately
+        self.local_wheel = os.path.abspath(local_wheel) if local_wheel else None
+        
         self.sandbox_dir = None
         self.sandbox_python_exec = None
         
@@ -146,18 +169,38 @@ class SignatureResolver:
         
         self.sandbox_python_exec = os.path.join(path, ".venv", "Scripts", "python.exe") if os.name == 'nt' else os.path.join(path, ".venv", "bin", "python")
             
-        # 2. Install the package explicitly using the sandbox's python executable
-        # This strictly binds the installation to the sandbox, ignoring host environments
+        # 2. Determine installation target
+        # If a local wheel is provided, install that file. Otherwise, pull from PyPI.
+        install_target = self.local_wheel if self.local_wheel else f"{self.package_to_sandbox}=={self.target_version}"
+        
+        # 3. Install into the sandbox
         subprocess.run(
-            ["uv", "pip", "install", "--python", self.sandbox_python_exec, f"{self.package_to_sandbox}=={self.target_version}"],
+            ["uv", "pip", "install", "--python", self.sandbox_python_exec, install_target],
             cwd=path, check=True, capture_output=True
         )
 
     def resolve(self, package_name: str, method_name: str) -> SignatureDefinition:
-        target_exec = self.sandbox_python_exec if (self.sandbox_dir and package_name == self.package_to_sandbox) else self.project_python_exec
+        target_exec = (
+            self.sandbox_python_exec
+            if (
+                self.sandbox_dir
+                and package_name.replace("-", "_").lower()
+                == self.package_to_sandbox.replace("-", "_").lower()
+            )
+            else self.project_python_exec
+        )
+
+        print("\n--- SIGNATURE DEBUG ---")
+        print("Package:", package_name)
+        print("Method:", method_name)
+        print("Project Python:", self.project_python_exec)
+        print("Sandbox Python:", self.sandbox_python_exec)
+        print("Selected Python:", target_exec)
+        print("-----------------------\n")
         
         # 1. Run dynamic worker in the target environment
         data = self.runtime_provider.resolve(target_exec, package_name, method_name)
+        print("WORKER RESULT:", data)
         status = data.get("status", "UNSUPPORTED_CALLABLE")
         
         if status == "SUCCESS":

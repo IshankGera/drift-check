@@ -1,41 +1,100 @@
+import subprocess
+from enum import Enum
+from dataclasses import dataclass
+from typing import Optional
+from packaging.requirements import Requirement, InvalidRequirement
+from packaging.version import Version, InvalidVersion
 import re
 from pathlib import Path
-from typing import List
-from drift_check.models import Dependency
 
-class DependencyResolver:
-    def __init__(self, dependency_files: List[Path]):
-        self.dependency_files = dependency_files
+class BaselineStatus(Enum):
+    MATCH = "MATCH"
+    MISMATCH = "MISMATCH"
+    NOT_INSTALLED = "NOT_INSTALLED"
+    INVALID_DECLARATION = "INVALID_DECLARATION"
 
-    def resolve(self) -> List[Dependency]:
-        dependencies = []
+@dataclass
+class ResolvedBaseline:
+    package_name: str
+    declared_specifier: str
+    installed_version: Optional[str]
+    status: BaselineStatus
+    baseline_version: Optional[str] # The single source of truth for the analysis (only populated on MATCH)
+
+class BaselineResolver:
+    def __init__(self, target_python_exec: str):
+        """Inject the Python executable discovered by EnvironmentDetector."""
+        self.target_python_exec = target_python_exec
+
+    def get_installed_version(self, package_name: str) -> Optional[str]:
+        """Extracts the absolute truth from the target project's .venv."""
+        script = f"import importlib.metadata; print(importlib.metadata.version('{package_name}'))"
+        try:
+            result = subprocess.run(
+                [self.target_python_exec, "-c", script],
+                capture_output=True, text=True, check=True
+            )
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return None
+
+    def resolve(self, package_name: str, declared_specifier: str) -> ResolvedBaseline:
+        installed_version = self.get_installed_version(package_name)
         
-        for file_path in self.dependency_files:
-            if file_path.name == "requirements.txt":
-                dependencies.extend(self._parse_requirements_txt(file_path))
-                
-        return dependencies
+        if not installed_version:
+            return ResolvedBaseline(
+                package_name, declared_specifier, None, 
+                BaselineStatus.NOT_INSTALLED, None
+            )
 
-    def _parse_requirements_txt(self, file_path: Path) -> List[Dependency]:
-        deps = []
-        pattern = re.compile(r"^([a-zA-Z0-9_\-]+)(.*)$")
+        try:
+            req = Requirement(declared_specifier)
+            parsed_installed = Version(installed_version)
+        except (InvalidRequirement, InvalidVersion):
+            return ResolvedBaseline(
+                package_name, declared_specifier, installed_version, 
+                BaselineStatus.INVALID_DECLARATION, None
+            )
+
+        # req.specifier automatically handles ranges (>=, <, ~=, ==) or empty specifiers
+        if parsed_installed in req.specifier:
+            return ResolvedBaseline(
+                package_name, declared_specifier, installed_version, 
+                BaselineStatus.MATCH, installed_version
+            )
+        else:
+            return ResolvedBaseline(
+                package_name, declared_specifier, installed_version, 
+                BaselineStatus.MISMATCH, None
+            )
+
+class DependencyDeclarationResolver:
+    def __init__(self, target_dir: str):
+        self.target_dir = Path(target_dir).resolve()
+
+    def find(self, package_name: str) -> Optional[str]:
+        """
+        Parses requirements.txt to find the declared specifier for a specific package.
+        MVP: Only supports requirements.txt.
+        """
+        req_file = self.target_dir / "requirements.txt"
+        if not req_file.exists():
+            return None
+
+        # Normalize package name (PyPI treats '-' and '_' as equivalent)
+        target_name = package_name.lower().replace("_", "-")
         
-        with open(file_path, "r", encoding="utf-8-sig") as f:
+        with open(req_file, "r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                    
-                match = pattern.match(line)
+                
+                # Extract the base package name from the line
+                match = re.match(r"^([a-zA-Z0-9_\-]+)(.*)$", line)
                 if match:
-                    name = match.group(1).strip()
-                    specifier = match.group(2).strip()
-                    is_pinned = "==" in specifier
-                    
-                    deps.append(Dependency(
-                        name=name,
-                        installed_version=None,
-                        is_pinned=is_pinned,
-                        specifier=specifier
-                    ))
-        return deps
+                    name_in_file = match.group(1).strip().lower().replace("_", "-")
+                    if name_in_file == target_name:
+                        return line # Returns the full string, e.g., "openai>=1.50.0"
+                        
+        return None

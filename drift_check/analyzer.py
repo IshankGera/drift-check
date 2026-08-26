@@ -12,14 +12,14 @@ class CallSiteVisitor(ast.NodeVisitor):
         # Tracks: {"OpenAI": "openai"}
         self.imports: Dict[str, str] = {}
         # Tracks: {"client": "OpenAI"}
-        self.assignments: Dict[str, str] = {}
+        self.assignments: Dict[str, tuple[str, str]] = {}
 
     def visit_Import(self, node: ast.Import):
-            for alias in node.names:
-                # Handles 'import requests' and 'import requests as req'
-                local_name = alias.asname or alias.name
-                self.imports[local_name] = alias.name.split('.')[0]
-            self.generic_visit(node)
+        for alias in node.names:
+            local_name = alias.asname or alias.name.split('.')[0]
+            self.imports[local_name] = alias.name.split('.')[0]
+
+        self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom):
         if node.module:
@@ -28,51 +28,90 @@ class CallSiteVisitor(ast.NodeVisitor):
                 self.imports[local_name] = node.module.split('.')[0]
         self.generic_visit(node)
 
-    def visit_ImportFrom(self, node: ast.ImportFrom):
-        if node.module:
-            for alias in node.names:
-                # Maps the imported class/function to its base package
-                local_name = alias.asname or alias.name
-                self.imports[local_name] = node.module.split('.')[0]
-        self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign):
-        # Very basic tracking for: client = OpenAI()
-        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
-            class_name = node.value.func.id
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    self.assignments[target.id] = class_name
+        # Track:
+        # client = mock_sdk.Client()
+        if isinstance(node.value, ast.Call):
+            func = node.value.func
+
+            if isinstance(func, ast.Attribute):
+                parts = self._resolve_attribute_chain(func)
+
+                if len(parts) >= 2:
+                    # Example:
+                    # mock_sdk.Client()
+                    #
+                    # parts = ["mock_sdk", "Client"]
+
+                    package_name = self.imports.get(parts[0])
+
+                    if package_name:
+                        class_name = parts[-1]
+
+                        for target in node.targets:
+                            if isinstance(target, ast.Name):
+                                self.assignments[target.id] = (
+                                    package_name,
+                                    class_name
+                                )
+
+            elif isinstance(func, ast.Name):
+                # Example:
+                # client = Client()
+                class_name = func.id
+                package_name = self.imports.get(class_name)
+
+                if package_name:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            self.assignments[target.id] = (
+                                package_name,
+                                class_name
+                            )
+
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call):
         if isinstance(node.func, ast.Attribute):
             parts = self._resolve_attribute_chain(node.func)
+
             if parts:
                 base_var = parts[0]
                 method_chain = ".".join(parts[1:])
-                
-                # Resolve base_var -> Class -> Package
-                class_name = self.assignments.get(base_var, base_var)
-                package_name = self.imports.get(class_name)
-                
+
+                # Resolve:
+                # client -> ("mock_sdk", "Client")
+                assignment = self.assignments.get(base_var)
+
+                if assignment:
+                    package_name, class_name = assignment
+                    method_name = f"{class_name}.{method_chain}"
+                else:
+                    package_name = self.imports.get(base_var)
+                    method_name = method_chain
+
                 if package_name:
                     kwargs = []
                     has_dynamic = False
+
                     for kw in node.keywords:
                         if kw.arg is None:
-                            has_dynamic = True # **kwargs was used
+                            has_dynamic = True
                         else:
                             kwargs.append(kw.arg)
-                            
-                    self.call_sites.append(CallSite(
-                        file_path=self.file_path,
-                        line_number=node.lineno,
-                        package_name=package_name,
-                        method_name=method_chain,
-                        kwargs_passed=kwargs,
-                        has_dynamic_kwargs=has_dynamic
-                    ))
+
+                    self.call_sites.append(
+                        CallSite(
+                            file_path=self.file_path,
+                            line_number=node.lineno,
+                            package_name=package_name,
+                            method_name=method_name,
+                            kwargs_passed=kwargs,
+                            has_dynamic_kwargs=has_dynamic
+                        )
+                    )
+
         self.generic_visit(node)
 
     def _resolve_attribute_chain(self, node: ast.expr) -> List[str]:
