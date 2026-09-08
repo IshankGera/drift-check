@@ -92,6 +92,22 @@ class CallSiteVisitor(ast.NodeVisitor):
                     method_name = method_chain
 
                 if package_name:
+
+                    # Ignore SDK class constructors.
+                    # Example:
+                    # mock_sdk.Client()
+                    #
+                    # We only want actual API usage such as:
+                    # client.create()
+                    if (
+                        not assignment
+                        and len(parts) == 2
+                        and parts[0] in self.imports
+                        and parts[1][:1].isupper()
+                    ):
+                        self.generic_visit(node)
+                        return
+
                     kwargs = []
                     has_dynamic = False
 

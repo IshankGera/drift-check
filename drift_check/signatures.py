@@ -10,9 +10,8 @@ import typing
 from typing import List, Optional
 from drift_check.models import SignatureDefinition
 
-# The inline worker now handles both standard signatures and TypedDicts securely in the target environment
 INLINE_WORKER = """
-import sys, json, importlib, inspect, typing , os
+import sys, json, importlib, inspect, typing, os
 sys.path.insert(0, os.getcwd())
 
 SDK_REGISTRY = {
@@ -23,8 +22,8 @@ def main():
     package_name, method_name = sys.argv[1], sys.argv[2]
     full_call = f"{package_name}.{method_name}"
     
+    # --- PHASE 1: Object Traversal ---
     try:
-        # 1. Resolve physical path via Registry or standard traversal
         if full_call in SDK_REGISTRY:
             mod_path, class_path = SDK_REGISTRY[full_call]
             current_obj = importlib.import_module(mod_path)
@@ -35,26 +34,32 @@ def main():
             for part in method_name.split('.'):
                 current_obj = getattr(current_obj, part)
                 
-        # 2. Standard Runtime Inspection
+        # --- PHASE 1.5: Deprecation Proxy Detection ---
+        # Traps clever SDK stubs (like OpenAI) that mask removed methods behind proxies
+        if current_obj.__class__.__name__ == "APIRemovedInV1Proxy":
+            print(json.dumps({"status": "METHOD_NOT_FOUND"}))
+            return
+            
+    except Exception:
+        # If we fail to traverse (AttributeError, or a custom SDK removal Exception)
+        print(json.dumps({"status": "METHOD_NOT_FOUND"}))
+        return
+
+    # --- PHASE 2: Signature Inspection ---
+    try:
         sig = inspect.signature(current_obj)
         params = list(sig.parameters.keys())
         has_varkw = False
         
-        # 3. Targeted TypedDict Extraction
         for param in sig.parameters.values():
             if param.kind == inspect.Parameter.VAR_KEYWORD:
                 has_varkw = True
-                
-                # Check if kwargs is annotated with Unpack[TypedDict]
                 ann = param.annotation
                 if ann != inspect.Parameter.empty:
                     type_args = getattr(ann, '__args__', None)
                     target_type = type_args[0] if type_args else ann
-                    
                     if hasattr(target_type, '__annotations__'):
-                        # Found the TypedDict! Append its keys to our valid parameters
                         params.extend(target_type.__annotations__.keys())
-                        # Since we successfully unpacked it, it is no longer an unknown wildcard
                         has_varkw = False 
         
         print(json.dumps({
@@ -63,17 +68,10 @@ def main():
             "accepts_kwargs": has_varkw
         }))
         
-    except ModuleNotFoundError:
-        print(json.dumps({"status": "PACKAGE_NOT_INSTALLED"}))
-    except AttributeError:
-        print(json.dumps({"status": "METHOD_NOT_FOUND"}))
     except ValueError:
         print(json.dumps({"status": "SIGNATURE_UNAVAILABLE"}))
-    except Exception as e:
-        print(json.dumps({
-            "status": "UNSUPPORTED_CALLABLE",
-            "error": repr(e)
-        }))
+    except Exception:
+        print(json.dumps({"status": "UNSUPPORTED_CALLABLE"}))
 
 if __name__ == '__main__':
     main()
@@ -143,11 +141,19 @@ class StubProvider:
         return None
 
 class SignatureResolver:
-    def __init__(self, project_python_exec: str, target_version: Optional[str] = None, package_to_sandbox: Optional[str] = None, local_wheel: Optional[str]=None):
+    def __init__(
+    self,
+    project_python_exec: str,
+    target_version: Optional[str] = None,
+    package_to_sandbox: Optional[str] = None,
+    local_wheel: Optional[str] = None,
+    verbose: bool = False
+        ):
         self.project_python_exec = project_python_exec
         self.target_version = target_version
         self.package_to_sandbox = package_to_sandbox
-        
+        self.verbose = verbose
+
         # FIX: Convert the relative wheel path to an absolute path immediately
         self.local_wheel = os.path.abspath(local_wheel) if local_wheel else None
         
@@ -190,17 +196,20 @@ class SignatureResolver:
             else self.project_python_exec
         )
 
-        print("\n--- SIGNATURE DEBUG ---")
-        print("Package:", package_name)
-        print("Method:", method_name)
-        print("Project Python:", self.project_python_exec)
-        print("Sandbox Python:", self.sandbox_python_exec)
-        print("Selected Python:", target_exec)
-        print("-----------------------\n")
+        if self.verbose:
+            print("\n--- SIGNATURE DEBUG ---")
+            print("Package:", package_name)
+            print("Method:", method_name)
+            print("Project Python:", self.project_python_exec)
+            print("Sandbox Python:", self.sandbox_python_exec)
+            print("Selected Python:", target_exec)
+            print("-----------------------\n")
         
         # 1. Run dynamic worker in the target environment
         data = self.runtime_provider.resolve(target_exec, package_name, method_name)
-        print("WORKER RESULT:", data)
+        if self.verbose:
+            print("WORKER RESULT:", data)
+        # print("WORKER RESULT:", data)
         status = data.get("status", "UNSUPPORTED_CALLABLE")
         
         if status == "SUCCESS":

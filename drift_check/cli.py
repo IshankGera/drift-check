@@ -10,12 +10,26 @@ from drift_check.analyzer import ASTAnalyzer
 from drift_check.signatures import SignatureResolver
 from drift_check.rules import RuleEngine
 from drift_check.reporter import Reporter
+import importlib.metadata
 
 app = typer.Typer()
 console = Console()
 
+
+def version_callback(value: bool):
+    if value:
+        print(f"drift-check {importlib.metadata.version('py-drift-check')}")
+        raise typer.Exit()
 @app.callback()
-def main():
+def main(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=version_callback,
+        is_eager=True,
+        help="Show the installed Drift Check version."
+    )
+):
     """Drift Check: Proactive upgrade-impact analyzer."""
     pass
 
@@ -23,15 +37,21 @@ def main():
 def upgrade(
     package: str = typer.Argument(..., help="The package to analyze (e.g., openai)"),
     to_version: str = typer.Option(
-    ...,
-    "--to",
-    help="Target version to check against (e.g., 15)"
-),
-local_wheel: str = typer.Option(
-    None,
-    "--local-wheel",
-    help="Local wheel to use instead of downloading the target package from PyPI"
-)
+        ...,
+        "--to",
+        help="Target version to check against (e.g., 15)"
+    ),
+    local_wheel: str = typer.Option(
+        None,
+        "--local-wheel",
+        help="Local wheel to use instead of downloading the target package from PyPI"
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Show detailed diagnostic information."
+    )
 ):
     console.print(f"[bold blue]Starting Upgrade Analysis for {package} -> {to_version}...[/bold blue]")
     
@@ -91,7 +111,8 @@ local_wheel: str = typer.Option(
     project_python_exec=project_python,
     target_version=resolved_target,
     package_to_sandbox=package,
-    local_wheel=local_wheel
+    local_wheel=local_wheel,
+    verbose=verbose
     )
 
     # 5. AST Scanning & Rule Evaluation
