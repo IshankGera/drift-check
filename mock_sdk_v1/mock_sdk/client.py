@@ -1,11 +1,12 @@
 class Client:
-    def create(self, name, old_param=None):
-        return "v1"
-
+    pass
 
 def unchanged_method(name):
     pass
 
+def create(name, old_param=None):
+    return "v1"
 
-def old_method():
+# NEW: Add dynamic kwargs method
+def dynamic_call(**kwargs):
     pass

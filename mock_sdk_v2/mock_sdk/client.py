@@ -1,11 +1,13 @@
 class Client:
-    def create(self, name, new_param=None):
-        return "v2"
+    pass
 
+# NEW: Simulate a non-breaking addition in the target version
+def unchanged_method(name, new_param=None):
+    pass
 
-def unchanged_method(name, non_breaking_addition=None):
+def create(name, new_param=None):
     return "v2"
 
-
+# NEW: Add dynamic kwargs method
 def dynamic_call(**kwargs):
-    return "v2"
+    pass

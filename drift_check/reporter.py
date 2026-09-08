@@ -10,7 +10,8 @@ class Reporter:
 
     def generate_console_report(self, findings: List[Finding]):
         if not findings:
-            self.console.print("[green]No findings to report![/green]")
+            self.console.print("[green]✓ No compatibility issues found.[/green]")
+            self.console.print("[green]Upgrade analysis passed.[/green]")
             return
 
         self.console.print("\n[bold]Drift Check Results:[/bold]")
@@ -40,6 +41,19 @@ class Reporter:
             )
         
         self.console.print(table)
+        errors = sum(1 for f in findings if f.severity == "ERROR")
+        warnings = sum(1 for f in findings if f.severity == "WARNING")
+
+        if errors:
+            self.console.print(
+                f"\n[bold red]❌ Upgrade analysis failed: "
+                f"{errors} incompatible API call(s) detected.[/bold red]"
+            )
+        elif warnings:
+            self.console.print(
+                f"\n[bold yellow]⚠ Upgrade analysis completed with "
+                f"{warnings} warning(s).[/bold yellow]"
+            )
 
     def generate_json_report(self, findings: List[Finding], output_path: str = "report.json"):
         data = [
