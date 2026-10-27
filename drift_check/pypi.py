@@ -23,10 +23,10 @@ class PyPIResolver:
                 console.print(f"[bold red]❌ Error:[/bold red] Package '{self.package_name}' not found on PyPI.")
             else:
                 console.print(f"[bold red]❌ Error:[/bold red] Failed to communicate with PyPI ({e.code}).")
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=2)
         except Exception as e:
             console.print(f"[bold red]❌ Error:[/bold red] {str(e)}")
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=2)
 
     def normalize_version(self, requested: str) -> str:
         """Normalizes shorthand versions to explicit semantic versions."""
@@ -54,7 +54,7 @@ class PyPIResolver:
             req_v = Version(normalized)
         except InvalidVersion:
             console.print(f"[bold red]❌ Error:[/bold red] Invalid version format: '{normalized}'")
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=2)
 
         valid_patches = []
         for r in releases:
@@ -68,7 +68,7 @@ class PyPIResolver:
 
         if not valid_patches:
             console.print(f"[bold red]❌ Error:[/bold red] Release {normalized} not found, and no alternative patches exist for this version line.")
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=2)
 
         best_match = str(max(valid_patches))
         
@@ -80,4 +80,4 @@ class PyPIResolver:
             return best_match
         else:
             console.print("[dim]Operation cancelled by user.[/dim]")
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=2)

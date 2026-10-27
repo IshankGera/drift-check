@@ -1,7 +1,9 @@
+from typing import List
+
 from drift_check.models import CallSite, SignatureDefinition, Finding
 
 class RuleEngine:
-    def evaluate(self, call: CallSite, sig: SignatureDefinition) -> list[Finding]:
+    def evaluate(self, call: CallSite, sig: SignatureDefinition) -> List[Finding]:
         findings = []
 
         # 1. Method-level compatibility
@@ -24,6 +26,26 @@ class RuleEngine:
                     package_name=call.package_name,
                     method_name=call.method_name,
                     message=f"Failed to inspect target sandbox for '{sig.package_name}'."
+                ))
+
+            elif sig.error_code == "IMPORT_FAILED":
+                findings.append(Finding(
+                    severity="WARNING",
+                    file_path=call.file_path,
+                    line_number=call.line_number,
+                    package_name=call.package_name,
+                    method_name=call.method_name,
+                    message=f"'{sig.package_name}' could not be imported in the target sandbox. Cannot verify '{sig.method_name}'."
+                ))
+
+            elif sig.error_code == "UNRESOLVED":
+                findings.append(Finding(
+                    severity="WARNING",
+                    file_path=call.file_path,
+                    line_number=call.line_number,
+                    package_name=call.package_name,
+                    method_name=call.method_name,
+                    message=f"Could not resolve '{sig.method_name}' through an instance attribute without type hints. (Confidence: LOW)"
                 ))
 
             elif sig.error_code == "SIGNATURE_UNAVAILABLE":
