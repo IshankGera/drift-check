@@ -1,4 +1,3 @@
-﻿```markdown
 # drift-check 🔎
 
 **Stop guessing if a dependency upgrade will break your Python code.**
@@ -9,11 +8,19 @@ Instead of generic linting, `drift-check` spins up an isolated sandbox, extracts
 
 ## 🚀 How It Works
 
-1. **Baseline Verification:** Parses your `requirements.txt` and active `.venv` to mathematically prove your current environment is stable.
+1. **Baseline Verification:** Parses your `requirements.txt` and active `.venv` to confirm the installed version matches what you declared.
 2. **PyPI Resolution:** Validates and normalizes your target version (e.g., resolving `15` to `15.0.0` automatically).
-3. **Targeted Sandboxing:** Uses `uv` to silently spin up a temporary virtual environment containing the future target package.
+3. **Targeted Sandboxing:** Uses `uv` (installed automatically as a dependency) to silently spin up a temporary virtual environment containing the future target package.
 4. **AST Intersection Analysis:** Reads your Python files without executing them, identifying only the API calls your code actually makes, and cross-references them against the target sandbox.
 5. **CI/CD Ready:** Exits with code `1` if breaking changes are found, blocking bad dependency updates from merging.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | No breaking changes (warnings may be present) |
+| `1` | Breaking changes found: a used method or parameter no longer exists |
+| `2` | Setup error: package not declared/installed, version not found, invalid wheel, or sandbox build failed |
 
 ## 📦 Installation
 
@@ -77,7 +84,7 @@ Build Failed: Incompatible API calls detected in target version.
 
 ```
 
-## ⚠️ Features & Current Limitations (v0.2.0)
+## ⚠️ Features & Current Limitations
 
 This tool is in active development.
 
@@ -87,16 +94,18 @@ This tool is in active development.
 * PyPI fallback resolution prompts.
 * Unpacking modern `TypedDict` and `Unpack` type-hints for strict kwargs evaluation.
 * Seamless `uv` sandbox management.
-* Local `.whl` file bypass support.
+* Local `.whl` file bypass support (the wheel's name and version are validated against `--to`).
+* Client-object SDKs (e.g. `client = OpenAI(); client.chat.completions.create(...)`) are resolved by following property and attribute type hints. When a hop has no type hint, the call is reported as a low-confidence warning instead of an error.
 
 **Known Limitations:**
 
 * **Dependency Files:** Currently only supports reading baselines from `requirements.txt` (support for `pyproject.toml` and `uv.lock` is planned).
-* **Variable Inference:** Currently struggles to trace methods called on complex instantiated variables across multiple files (e.g., `app.post` in FastAPI frameworks).
+* **Variable Inference:** Instances are traced within a single file only (`client = Client()` → `client.create()`). Objects passed between files or returned from functions are not traced yet.
 * **Dynamic Kwargs:** Cannot statically verify dynamic arguments passed at the call site (e.g., `client.create(**my_dict)`).
+* **Positional Arguments:** Only keyword arguments are checked today.
+* **Import names:** The package name must match its import name (e.g. `openai`, `stripe`). Packages like `pyyaml` → `yaml` are not mapped yet.
 
 ## License
 
 MIT
 
-```
