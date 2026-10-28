@@ -1,5 +1,6 @@
-from dataclasses import dataclass
-from typing import Optional, List
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
 
 @dataclass
 class Dependency:
@@ -7,6 +8,7 @@ class Dependency:
     installed_version: Optional[str]
     is_pinned: bool
     specifier: str
+
 
 @dataclass
 class CallSite:
@@ -16,6 +18,10 @@ class CallSite:
     method_name: str
     kwargs_passed: List[str]
     has_dynamic_kwargs: bool
+    # Keyword arguments whose value is a plain literal in the source,
+    # e.g. model="o3-mini" -> {"model": "o3-mini"}. Used by `drift-check probe`.
+    literal_kwargs: Dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class SignatureDefinition:
@@ -24,8 +30,9 @@ class SignatureDefinition:
     valid_parameters: List[str]
     is_unknown: bool = False
     accepts_kwargs: bool = False
-    error_code: str = "SUCCESS"  
-    
+    error_code: str = "SUCCESS"
+
+
 @dataclass
 class Finding:
     severity: str

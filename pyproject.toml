@@ -1,12 +1,12 @@
 [project]
 name = "py-drift-check"
-version = "0.2.6"
-description = "Upgrade-impact analyzer: check your Python code against a future dependency version before you upgrade."
+version = "0.3.0"
+description = "Check your Python code against a future dependency version, and your OpenAI-compatible calls against the live server, before you upgrade or deploy."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Ishank Gera", email = "geraishank09@gmail.com" }]
-keywords = ["dependencies", "upgrade", "api-drift", "breaking-changes", "static-analysis", "ci"]
+keywords = ["dependencies", "upgrade", "api-drift", "breaking-changes", "static-analysis", "ci", "openai", "llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
