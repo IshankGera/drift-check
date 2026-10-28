@@ -1,4 +1,7 @@
 import os
+from pathlib import Path
+from urllib.parse import urlparse
+
 import typer
 from rich.console import Console
 from packaging.utils import canonicalize_name, parse_wheel_filename, InvalidWheelFilename
@@ -9,6 +12,7 @@ from drift_check.pypi import PyPIResolver
 from drift_check.scanner import ProjectScanner
 from drift_check.analyzer import ASTAnalyzer
 from drift_check.signatures import SignatureResolver, SandboxError
+from drift_check import probe as probe_mod
 from drift_check.rules import RuleEngine
 from drift_check.reporter import Reporter
 import importlib.metadata
@@ -137,7 +141,7 @@ def upgrade(
     py_files, _ = scanner.scan()
     normalized_target_pkg = normalize_name(package)
     call_sites = [
-        call for call in ASTAnalyzer(py_files).analyze()
+        call for call in ASTAnalyzer(py_files, root=Path(".")).analyze()
         if normalize_name(call.package_name) == normalized_target_pkg
     ]
 
@@ -187,6 +191,93 @@ def upgrade(
     if has_breaking_changes:
         console.print("\n[bold red]Build Failed:[/bold red] Incompatible API calls detected in target version.")
         raise typer.Exit(code=EXIT_BREAKING)
+
+@app.command()
+def probe(
+    model: str = typer.Option(
+        None, "--model", "-m",
+        help="Model to test. Overrides model= literals in the code (needed when the model comes from config)."
+    ),
+    base_url: str = typer.Option(
+        None, "--base-url",
+        help="OpenAI-compatible API base URL. Defaults to $OPENAI_BASE_URL or https://api.openai.com/v1."
+    ),
+    api_key_env: str = typer.Option(
+        "OPENAI_API_KEY", "--api-key-env",
+        help="Name of the environment variable holding the API key."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show the requests that would be sent, without sending anything."
+    ),
+    max_requests: int = typer.Option(
+        20, "--max-requests", help="Safety cap on the number of unique requests sent."
+    ),
+):
+    """
+    Check your chat.completions.create() calls against the LIVE server.
+
+    Sends one tiny request per unique (model, parameters) combination, directly from
+    this machine to the provider, using your own API key. Catches server-side rejections
+    the Python SDK cannot see, e.g. 'max_tokens' not supported -> use 'max_completion_tokens'.
+    """
+    base_url = base_url or os.environ.get("OPENAI_BASE_URL") or probe_mod.DEFAULT_BASE_URL
+    host = urlparse(base_url).netloc or base_url
+
+    console.print("[bold blue]Probing OpenAI-compatible calls against the live server...[/bold blue]")
+    console.print("[dim]Scanning codebase for chat.completions.create() calls...[/dim]")
+    py_files, _ = ProjectScanner(".").scan()
+    call_sites = ASTAnalyzer(py_files, root=Path(".")).analyze()
+    cases, unprobeable = probe_mod.build_cases(call_sites, model_override=model)
+
+    findings = [
+        probe_mod.Finding("WARNING", c.file_path, c.line_number, c.package_name, c.method_name, reason)
+        for c, reason in unprobeable
+    ]
+
+    if not cases:
+        reporter = Reporter()
+        if findings:
+            reporter.generate_console_report(findings, label="Server probe")
+        else:
+            console.print("[green]✓ No chat.completions.create() calls found. Nothing to probe.[/green]")
+        return
+
+    if len(cases) > max_requests:
+        console.print(
+            f"[bold red]❌ Error:[/bold red] {len(cases)} unique requests needed, above --max-requests {max_requests}."
+        )
+        raise typer.Exit(code=EXIT_TOOL_ERROR)
+
+    if dry_run:
+        console.print(f"\n[bold]Dry run:[/bold] {len(cases)} request(s) would be sent to {host}\n")
+        for case in cases:
+            sites = ", ".join(f"{Path(c.file_path).name}:{c.line_number}" for c in case.call_sites)
+            console.print(f"  • model={case.model} params={case.params}  [dim]({sites})[/dim]")
+            if case.skipped_params:
+                console.print(f"    [yellow]not probed (no literal value):[/yellow] {', '.join(case.skipped_params)}")
+        return
+
+    api_key = os.environ.get(api_key_env)
+    if not api_key:
+        console.print(
+            f"[bold red]❌ Error:[/bold red] ${api_key_env} is not set. "
+            f"Set it, or point --api-key-env at the variable holding your key."
+        )
+        raise typer.Exit(code=EXIT_TOOL_ERROR)
+
+    console.print(f"[dim]Sending {len(cases)} minimal request(s) to {host} with your API key...[/dim]")
+    for case in cases:
+        for sent_case, result in probe_mod.run_case(base_url, api_key, case):
+            if result.status in ("AUTH_ERROR", "NETWORK_ERROR"):
+                console.print(f"[bold red]❌ Error:[/bold red] Could not reach {host}: {result.message}")
+                raise typer.Exit(code=EXIT_TOOL_ERROR)
+            findings.extend(probe_mod.findings_for(sent_case, result))
+
+    Reporter().generate_console_report(findings, label="Server probe")
+    if any(f.severity == "ERROR" for f in findings):
+        console.print("\n[bold red]Build Failed:[/bold red] The server rejects calls made by this code.")
+        raise typer.Exit(code=EXIT_BREAKING)
+
 
 if __name__ == "__main__":
     app()

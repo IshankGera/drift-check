@@ -8,10 +8,10 @@ class Reporter:
     def __init__(self):
         self.console = Console()
 
-    def generate_console_report(self, findings: List[Finding]):
+    def generate_console_report(self, findings: List[Finding], label: str = "Upgrade analysis"):
         if not findings:
             self.console.print("[green]✓ No compatibility issues found.[/green]")
-            self.console.print("[green]Upgrade analysis passed.[/green]")
+            self.console.print(f"[green]{label} passed.[/green]")
             return
 
         self.console.print("\n[bold]Drift Check Results:[/bold]")
@@ -46,12 +46,12 @@ class Reporter:
 
         if errors:
             self.console.print(
-                f"\n[bold red]❌ Upgrade analysis failed: "
+                f"\n[bold red]❌ {label} failed: "
                 f"{errors} incompatible API call(s) detected.[/bold red]"
             )
         elif warnings:
             self.console.print(
-                f"\n[bold yellow]⚠ Upgrade analysis completed with "
+                f"\n[bold yellow]⚠ {label} completed with "
                 f"{warnings} warning(s).[/bold yellow]"
             )
 

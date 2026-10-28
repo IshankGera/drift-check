@@ -1,3 +1,5 @@
+import sys
+import urllib.error
 import urllib.request
 import json
 import typer
@@ -72,7 +74,14 @@ class PyPIResolver:
 
         best_match = str(max(valid_patches))
         
-        # 3. Interactive Prompt
+        # 3. Interactive Prompt (never prompt in CI / non-interactive shells)
+        if not sys.stdin.isatty():
+            console.print(
+                f"[bold red]❌ Error:[/bold red] Release {normalized} not found. "
+                f"Closest release: {best_match}. Pass --to {best_match} explicitly."
+            )
+            raise typer.Exit(code=2)
+
         console.print(f"\n[yellow]Release {normalized} not found.[/yellow]")
         console.print(f"Available suggested release:\n  [bold cyan]{best_match}[/bold cyan]\n")
         
