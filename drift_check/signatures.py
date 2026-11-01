@@ -57,12 +57,72 @@ def unwrap_type(tp):
     return tp if inspect.isclass(tp) else None
 
 
+def lazy_import_namespace(func):
+    """
+    Names imported lazily or only for type checking, e.g. openai 2.x:
+        @cached_property
+        def chat(self) -> Chat:
+            from .resources.chat import Chat
+    Collects `from X import Name` statements inside the function and at the top of its
+    module (including under `if TYPE_CHECKING:`), and imports those names on demand.
+    """
+    namespace = {}
+    module_name = getattr(func, "__module__", "") or ""
+    module = sys.modules.get(module_name)
+    package = getattr(module, "__package__", None) or module_name.rpartition(".")[0]
+    sources = []
+    try:
+        sources.append(textwrap.dedent(inspect.getsource(func)))
+    except Exception:
+        pass
+    try:
+        sources.append(inspect.getsource(module))
+    except Exception:
+        pass
+    for src in sources:
+        try:
+            tree = ast.parse(src)
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or not node.module and not node.level:
+                continue
+            target = ("." * node.level) + (node.module or "")
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if local in namespace:
+                    continue
+                try:
+                    mod = importlib.import_module(target, package=package if node.level else None)
+                    namespace[local] = getattr(mod, alias.name)
+                except Exception:
+                    try:
+                        sub = importlib.import_module(target + "." + alias.name if node.module else target + alias.name,
+                                                      package=package if node.level else None)
+                        namespace[local] = sub
+                    except Exception:
+                        pass
+    return namespace
+
+
+def eval_in(expr, namespace, owner):
+    """eval() an annotation/expression string, falling back to lazily imported names."""
+    try:
+        return eval(expr, namespace)
+    except Exception:
+        return eval(expr, {**namespace, **lazy_import_namespace(owner)})
+
+
 def resolve_annotation(ann, func):
     if isinstance(ann, str):
+        func_globals = getattr(func, "__globals__", {})
         try:
-            ann = eval(ann, getattr(func, "__globals__", {}))
+            ann = eval(ann, func_globals)
         except Exception:
-            return None
+            try:
+                ann = eval(ann, {**func_globals, **lazy_import_namespace(func)})
+            except Exception:
+                return None
     return unwrap_type(ann)
 
 
@@ -97,7 +157,7 @@ def instance_attr_type(cls, name):
             ann = raw[name]
             if isinstance(ann, str):
                 try:
-                    ann = eval(ann, module_globals)
+                    ann = eval_in(ann, module_globals, klass)
                 except Exception:
                     ann = None
             typ = unwrap_type(ann) if ann is not None else None
@@ -127,7 +187,7 @@ def instance_attr_type(cls, name):
                     candidates.append(node.value.func)
                 for expr in candidates:
                     try:
-                        typ = unwrap_type(eval(ast.unparse(expr), module_globals))
+                        typ = unwrap_type(eval_in(ast.unparse(expr), module_globals, klass))
                     except Exception:
                         typ = None
                     if typ is not None:

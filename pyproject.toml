@@ -1,6 +1,6 @@
 [project]
 name = "py-drift-check"
-version = "0.3.0"
+version = "0.3.1"
 description = "Check your Python code against a future dependency version, and your OpenAI-compatible calls against the live server, before you upgrade or deploy."
 readme = "README.md"
 requires-python = ">=3.9"
