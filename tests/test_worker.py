@@ -69,3 +69,20 @@ def test_import_failure_is_not_method_not_found(worker):
     r = worker("brokensdk", "anything")
     assert r["status"] == "IMPORT_FAILED"
     assert "missing optional dependency" in r["detail"]
+
+
+# Regression: openai 2.x imports return types lazily inside cached_property bodies
+def test_lazily_imported_return_type_is_followed(worker):
+    r = worker("lazysdk", "Client.chat.completions.create")
+    assert r["status"] == "SUCCESS"
+    assert set(r["valid_parameters"]) == {"model", "messages", "max_completion_tokens"}
+
+
+def test_type_checking_import_is_followed(worker):
+    r = worker("lazysdk", "Client.embeddings.create")
+    assert r["status"] == "SUCCESS" and set(r["valid_parameters"]) == {"model", "input"}
+
+
+def test_removed_param_detectable_through_lazy_chain(worker):
+    r = worker("lazysdk", "Client.chat.completions.create")
+    assert "max_tokens" not in r["valid_parameters"]
