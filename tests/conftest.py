@@ -61,6 +61,43 @@ FAKE_SDK = {
             def from_env(cls, prefix="X"):
                 pass
     """,
+    # openai 2.x style: return types imported lazily inside the property / under TYPE_CHECKING
+    "lazysdk/__init__.py": "from ._client import Client\n",
+    "lazysdk/_client.py": """
+        from __future__ import annotations
+        from functools import cached_property
+        from typing import TYPE_CHECKING
+
+        if TYPE_CHECKING:
+            from .resources.embeddings import Embeddings
+
+        class Client:
+            @cached_property
+            def chat(self) -> Chat:
+                from .resources.chat import Chat
+                return Chat()
+
+            @cached_property
+            def embeddings(self) -> Embeddings:
+                from .resources.embeddings import Embeddings
+                return Embeddings()
+    """,
+    "lazysdk/resources/__init__.py": "",
+    "lazysdk/resources/chat.py": """
+        class Completions:
+            def create(self, *, model, messages, max_completion_tokens=None):
+                pass
+
+        class Chat:
+            @property
+            def completions(self) -> Completions:
+                return Completions()
+    """,
+    "lazysdk/resources/embeddings.py": """
+        class Embeddings:
+            def create(self, *, model, input):
+                pass
+    """,
     "brokensdk/__init__.py": "raise ImportError('missing optional dependency')\n",
 }
 
