@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "description": "Known server-side parameter rules for OpenAI-compatible chat APIs. Used by `drift-check probe --offline`. Add your own with --rules.",
+  "rules": [
+    {
+      "id": "openai-reasoning-max-tokens",
+      "models": "^(o1|o3|o4|gpt-5)",
+      "param": "max_tokens",
+      "severity": "ERROR",
+      "message": "Reasoning models reject 'max_tokens' (HTTP 400 unsupported_parameter). Use 'max_completion_tokens' instead."
+    },
+    {
+      "id": "openai-reasoning-temperature",
+      "models": "^(o1|o3|o4)",
+      "param": "temperature",
+      "allowed_values": [1],
+      "severity": "WARNING",
+      "message": "Reasoning models may only accept the default temperature (1). Other values can be rejected by the server."
+    },
+    {
+      "id": "openai-reasoning-top-p",
+      "models": "^(o1|o3|o4)",
+      "param": "top_p",
+      "allowed_values": [1],
+      "severity": "WARNING",
+      "message": "Reasoning models may only accept the default top_p (1). Other values can be rejected by the server."
+    }
+  ]
+}

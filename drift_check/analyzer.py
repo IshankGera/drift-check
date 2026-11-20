@@ -56,8 +56,11 @@ class CallSiteVisitor(ast.NodeVisitor):
         self.project_instances = project_instances or {}
 
         self.call_sites: List[CallSite] = []
-        # Local name -> top-level package. {"OpenAI": "openai", "openai": "openai"}
-        self.imports: Dict[str, str] = {}
+        # Local name -> (top-level package, dotted path inside it).
+        #   import openai                      -> {"openai": ("openai", "")}
+        #   import openai.types as t           -> {"t": ("openai", "types")}
+        #   from openai.lib.azure import Azure -> {"Azure": ("openai", "lib.azure.Azure")}
+        self.imports: Dict[str, Tuple[str, str]] = {}
         # Variable -> instance. {"client": ("openai", "OpenAI")}
         self.assignments: Dict[str, Instance] = {}
         # self.<attr> -> instance. {"client": ("openai", "OpenAI")}
@@ -68,22 +71,39 @@ class CallSiteVisitor(ast.NodeVisitor):
 
     # ---------- imports ----------
 
+    def _record_import_site(self, node: ast.AST, package: str, path: str):
+        """Every imported name below the package root must still exist in the target version."""
+        if path:
+            self.call_sites.append(CallSite(
+                file_path=self.file_path, line_number=node.lineno, package_name=package,
+                method_name=path, kwargs_passed=[], has_dynamic_kwargs=False, kind="import",
+            ))
+
     def visit_Import(self, node: ast.Import):
         for alias in node.names:
-            local_name = alias.asname or alias.name.split(".")[0]
-            self.imports[local_name] = alias.name.split(".")[0]
+            top, _, rest = alias.name.partition(".")
+            if alias.asname:
+                self.imports[alias.asname] = (top, rest)   # import a.b as c -> c is a.b
+            else:
+                self.imports[top] = (top, "")              # import a.b      -> name `a` is bound
+            self._record_import_site(node, top, rest)
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom):
         source_module = self._resolve_from_module(node)
         for alias in node.names:
+            if alias.name == "*":
+                continue
             local_name = alias.asname or alias.name
             # `from svc.llm import client` where svc.llm defines `client = OpenAI()`
             exported = self.project_instances.get(source_module or "", {})
             if alias.name in exported:
                 self.assignments[local_name] = exported[alias.name]
             elif node.level == 0 and node.module:
-                self.imports[local_name] = node.module.split(".")[0]
+                top, _, rest = node.module.partition(".")
+                path = ".".join(p for p in (rest, alias.name) if p)
+                self.imports[local_name] = (top, path)
+                self._record_import_site(node, top, path)
         self.generic_visit(node)
 
     def _resolve_from_module(self, node: ast.ImportFrom) -> Optional[str]:
@@ -114,19 +134,24 @@ class CallSiteVisitor(ast.NodeVisitor):
 
     # ---------- instance tracking ----------
 
+    @staticmethod
+    def _join(*parts: str) -> str:
+        return ".".join(p for p in parts if p)
+
     def _instance_from_constructor(self, node: ast.expr) -> Optional[Instance]:
-        """OpenAI(...) / openai.OpenAI(...) -> ("openai", "OpenAI")"""
+        """OpenAI(...) / openai.OpenAI(...) / azure.AzureOpenAI(...) -> ("openai", "<path>.Class")"""
         if not isinstance(node, ast.Call):
             return None
         func = node.func
-        if isinstance(func, ast.Name):
-            package = self.imports.get(func.id)
-            if package and func.id[:1].isupper():
-                return package, func.id
+        if isinstance(func, ast.Name) and func.id in self.imports:
+            package, path = self.imports[func.id]
+            if path and path.split(".")[-1][:1].isupper():
+                return package, path
         elif isinstance(func, ast.Attribute):
             base, parts = _attribute_chain(func)
             if isinstance(base, ast.Name) and base.id in self.imports and parts[-1][:1].isupper():
-                return self.imports[base.id], parts[-1]
+                package, path = self.imports[base.id]
+                return package, self._join(path, *parts)
         return None
 
     def _record_assignment(self, target: ast.expr, instance: Instance):
@@ -160,7 +185,7 @@ class CallSiteVisitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call):
         resolved = self._resolve_call(node.func)
         if resolved:
-            package_name, method_name = resolved
+            package_name, method_name, kind = resolved
             kwargs, literals, has_dynamic = [], {}, False
             for kw in node.keywords:
                 if kw.arg is None:
@@ -179,11 +204,28 @@ class CallSiteVisitor(ast.NodeVisitor):
                     kwargs_passed=kwargs,
                     has_dynamic_kwargs=has_dynamic,
                     literal_kwargs=literals,
+                    positional_count=sum(1 for a in node.args if not isinstance(a, ast.Starred)),
+                    has_star_args=any(isinstance(a, ast.Starred) for a in node.args),
+                    kind=kind,
                 )
             )
         self.generic_visit(node)
 
-    def _resolve_call(self, func: ast.expr) -> Optional[Tuple[str, str]]:
+    @staticmethod
+    def _is_class_name(name: str) -> bool:
+        return name[:1].isupper()
+
+    def _resolve_call(self, func: ast.expr) -> Optional[Tuple[str, str, str]]:
+        """Returns (package, dotted path inside the package, kind) for calls into a package."""
+        # fn(...) / Client(...) where `from pkg import fn, Client`
+        if isinstance(func, ast.Name):
+            if func.id in self.imports:
+                package, path = self.imports[func.id]
+                if path:
+                    kind = "constructor" if self._is_class_name(path.split(".")[-1]) else "call"
+                    return package, path, kind
+            return None
+
         if not isinstance(func, ast.Attribute):
             return None
         base, parts = _attribute_chain(func)
@@ -198,11 +240,10 @@ class CallSiteVisitor(ast.NodeVisitor):
                 # client.chat.completions.create(...)
                 instance = self.assignments[base.id]
             elif base.id in self.imports:
-                # openai.ChatCompletion.create(...) / mock_sdk.create(...)
-                # Skip bare class constructors like mock_sdk.Client()
-                if len(parts) == 1 and parts[0][:1].isupper():
-                    return None
-                return self.imports[base.id], ".".join(parts)
+                # openai.ChatCompletion.create(...) / t.fn(...) / mock_sdk.Client(...)
+                package, path = self.imports[base.id]
+                kind = "constructor" if self._is_class_name(parts[-1]) else "call"
+                return package, self._join(path, *parts), kind
             else:
                 return None
         elif isinstance(base, ast.Call):
@@ -213,8 +254,8 @@ class CallSiteVisitor(ast.NodeVisitor):
 
         if not instance or not parts:
             return None
-        package_name, class_name = instance
-        return package_name, ".".join([class_name] + parts)
+        package_name, class_path = instance
+        return package_name, self._join(class_path, *parts), "call"
 
 
 class ASTAnalyzer:

@@ -168,3 +168,37 @@ def test_cli_bad_key_is_setup_error(project, server, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "wrong-key")
     result = CliRunner().invoke(app, ["probe", "--base-url", server])
     assert result.exit_code == 2 and "wrong-key" not in result.output
+    assert "rejected your API key" in result.output
+
+
+# ---------- offline rules ----------
+
+def test_offline_rules_catch_max_tokens_without_network():
+    rules = probe.load_rules()
+    findings = probe.offline_findings([chat("o3-mini", max_tokens=50), chat("gpt-4o", max_tokens=50)], rules)
+    assert [(f.severity, "max_completion_tokens" in f.message) for f in findings] == [("ERROR", True)]
+
+
+def test_offline_value_rules_only_flag_known_non_default_values():
+    rules = probe.load_rules()
+    literal = chat("o3-mini", temperature=0.2)
+    default = chat("o3-mini", temperature=1)
+    unknown = CallSite("app.py", 1, "openai", "OpenAI.chat.completions.create",
+                       ["model", "temperature"], False, {"model": "o3-mini"})
+    findings = probe.offline_findings([literal, default, unknown], rules)
+    assert [f.severity for f in findings] == ["WARNING"]
+
+
+def test_custom_rules_file(tmp_path):
+    custom = tmp_path / "rules.json"
+    custom.write_text('{"rules": [{"id": "groq-no-logprobs", "models": "^llama", "param": "logprobs", '
+                      '"severity": "ERROR", "message": "Not supported."}]}')
+    findings = probe.offline_findings([chat("llama-3.1-8b", logprobs=True)], probe.load_rules(str(custom)))
+    assert findings[0].severity == "ERROR" and "groq-no-logprobs" in findings[0].message
+
+
+def test_cli_offline_needs_no_key(project, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    result = CliRunner().invoke(app, ["probe", "--offline"])
+    assert result.exit_code == 1, result.output
+    assert "max_completion_tokens" in result.output and "Nothing was sent" in result.output

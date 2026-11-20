@@ -1,11 +1,17 @@
 import subprocess
 from enum import Enum
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 from packaging.requirements import Requirement, InvalidRequirement
 from packaging.version import Version, InvalidVersion
 import re
+import sys
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 class BaselineStatus(Enum):
     MATCH = "MATCH"
@@ -74,27 +80,113 @@ class DependencyDeclarationResolver:
 
     def find(self, package_name: str) -> Optional[str]:
         """
-        Parses requirements.txt to find the declared specifier for a specific package.
-        MVP: Only supports requirements.txt.
+        Finds the declared specifier for a specific package.
+        Search order: requirements.txt -> pyproject.toml -> uv.lock (pinned as ==version).
         """
+        target_name = canonicalize(package_name)
+        return (
+            self._find_in_requirements(target_name)
+            or self.pyproject_dependencies().get(target_name)
+            or self._find_in_uv_lock(target_name)
+        )
+
+    def declared(self) -> Dict[str, str]:
+        """
+        All direct dependencies, as {normalized name: specifier}.
+        requirements.txt wins over pyproject.toml when a package is in both.
+        """
+        deps = self.pyproject_dependencies()
+        deps.update(self.requirements_dependencies())
+        return deps
+
+    def _find_in_requirements(self, target_name: str) -> Optional[str]:
         req_file = self.target_dir / "requirements.txt"
         if not req_file.exists():
             return None
 
-        # Normalize package name (PyPI treats '-' and '_' as equivalent)
-        target_name = package_name.lower().replace("_", "-")
-        
+        with open(req_file, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.split(" #")[0].strip()
+                # Skip comments and pip options such as -r, -e, --index-url
+                if not line or line.startswith(("#", "-")):
+                    continue
+
+                # Extract the base package name from the line (dots allowed: zope.interface)
+                match = re.match(r"^([a-zA-Z0-9_\-.]+)", line)
+                if match and canonicalize(match.group(1)) == target_name:
+                    return line  # Returns the full string, e.g., "openai>=1.50.0"
+                        
+        return None
+
+    def requirements_dependencies(self) -> Dict[str, str]:
+        req_file = self.target_dir / "requirements.txt"
+        if not req_file.exists():
+            return {}
+
+        deps = {}
         with open(req_file, "r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#"):
+                # Skip comments and pip options such as -r, -e, --index-url
+                if not line or line.startswith(("#", "-")):
                     continue
-                
-                # Extract the base package name from the line
-                match = re.match(r"^([a-zA-Z0-9_\-]+)(.*)$", line)
+                match = re.match(r"^([a-zA-Z0-9_\-.]+)", line)
                 if match:
-                    name_in_file = match.group(1).strip().lower().replace("_", "-")
-                    if name_in_file == target_name:
-                        return line # Returns the full string, e.g., "openai>=1.50.0"
-                        
+                    deps.setdefault(canonicalize(match.group(1)), line)
+        return deps
+
+    def pyproject_dependencies(self) -> Dict[str, str]:
+        """
+        PEP 621 [project] dependencies and optional-dependencies, plus PEP 735 [dependency-groups].
+        """
+        data = self._load_toml("pyproject.toml")
+        if not data:
+            return {}
+
+        project = data.get("project", {})
+        entries = list(project.get("dependencies", []))
+        for group in project.get("optional-dependencies", {}).values():
+            entries.extend(group)
+        for group in data.get("dependency-groups", {}).values():
+            entries.extend(group)
+
+        own_name = canonicalize(project.get("name", ""))
+        deps = {}
+        for entry in entries:
+            # {include-group = "..."} tables are not requirements
+            if not isinstance(entry, str):
+                continue
+            try:
+                name = canonicalize(Requirement(entry).name)
+            except InvalidRequirement:
+                continue
+            if name != own_name:
+                deps.setdefault(name, entry)
+        return deps
+
+    def _find_in_uv_lock(self, target_name: str) -> Optional[str]:
+        data = self._load_toml("uv.lock")
+        if not data:
+            return None
+        for pkg in data.get("package", []):
+            # Editable/virtual entries are the project itself, not an installed release
+            if "registry" not in pkg.get("source", {}):
+                continue
+            if canonicalize(pkg.get("name", "")) == target_name and pkg.get("version"):
+                return f"{pkg['name']}=={pkg['version']}"
         return None
+
+    def _load_toml(self, filename: str) -> Optional[dict]:
+        path = self.target_dir / filename
+        if not path.exists():
+            return None
+        try:
+            with open(path, "rb") as f:
+                return tomllib.load(f)
+        except (tomllib.TOMLDecodeError, OSError):
+            return None
+
+
+def canonicalize(name: str) -> str:
+    """PyPI treats '-', '_' and '.' as equivalent, case-insensitively."""
+    return re.sub(r"[-_.]+", "-", name).lower()

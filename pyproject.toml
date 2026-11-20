@@ -1,12 +1,12 @@
 [project]
 name = "py-drift-check"
-version = "0.3.1"
-description = "Check your Python code against a future dependency version, and your OpenAI-compatible calls against the live server, before you upgrade or deploy."
+version = "0.4.0"
+description = "Know which lines of your Python code a dependency upgrade will break, before you upgrade: call-site checks, type-check diff, test diff, and an optional LLM server probe."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Ishank Gera", email = "geraishank09@gmail.com" }]
-keywords = ["dependencies", "upgrade", "api-drift", "breaking-changes", "static-analysis", "ci", "openai", "llm"]
+keywords = ["dependencies", "upgrade", "api-drift", "breaking-changes", "static-analysis", "ci", "type-checking", "testing", "openai", "llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -23,6 +23,7 @@ dependencies = [
     "rich>=13.7.0",
     "packaging>=24.0",
     "uv>=0.4.0",
+    "tomli>=1.1.0; python_version < '3.11'",
 ]
 
 [project.urls]

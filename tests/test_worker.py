@@ -86,3 +86,51 @@ def test_type_checking_import_is_followed(worker):
 def test_removed_param_detectable_through_lazy_chain(worker):
     r = worker("lazysdk", "Client.chat.completions.create")
     assert "max_tokens" not in r["valid_parameters"]
+
+
+def test_unimported_submodule_is_resolved(worker):
+    r = worker("fakesdk2", "tools.helper")
+    assert r["status"] == "SUCCESS" and set(r["valid_parameters"]) == {"path", "strict"}
+
+
+def test_missing_submodule_is_method_not_found(worker):
+    assert worker("fakesdk2", "gone.helper")["status"] == "METHOD_NOT_FOUND"
+
+
+# ---------- argument shape and deprecations ----------
+
+def test_required_and_positional_shape(worker):
+    r = worker("argsdk", "needs_region")
+    assert r["positional_names"] == ["name", "region"]
+    assert r["max_positional"] == 2
+    assert r["required_params"] == ["name", "region"]
+
+
+def test_varargs_means_unlimited_positional(worker):
+    assert worker("argsdk", "flexible")["max_positional"] is None
+
+
+def test_constructor_signature_excludes_self(worker):
+    r = worker("argsdk", "Client")
+    assert r["required_params"] == ["api_key"] and r["max_positional"] == 1
+
+
+def test_method_with_positional_only(worker):
+    r = worker("argsdk", "Client.send")
+    assert r["positional_names"] == ["payload", "retries"] and r["required_params"] == ["payload"]
+
+
+def test_warnings_warn_deprecation_detected(worker):
+    assert "new_style" in worker("argsdk", "old_style")["deprecated"]
+
+
+def test_conditional_warning_is_not_deprecation(worker):
+    assert worker("argsdk", "conditional")["deprecated"] is None
+
+
+def test_pep702_deprecated_detected(worker):
+    r = worker("argsdk", "make_client")
+    if r["status"] == "METHOD_NOT_FOUND":
+        import pytest
+        pytest.skip("typing_extensions not installed")
+    assert r["deprecated"] == "Use Client instead"

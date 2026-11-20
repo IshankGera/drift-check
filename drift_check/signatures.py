@@ -226,6 +226,18 @@ def traverse(package_name, method_name):
             # Custom SDK removal proxies raise on attribute access
             return "METHOD_NOT_FOUND", None
 
+        if nxt is _MISSING and inspect.ismodule(obj):
+            # Submodules are only attributes once imported: pkg.sub.fn
+            submodule = f"{obj.__name__}.{part}"
+            try:
+                nxt = importlib.import_module(submodule)
+            except ModuleNotFoundError as e:
+                if e.name != submodule:
+                    return "IMPORT_FAILED", f"{type(e).__name__}: {e}"
+                nxt = _MISSING
+            except Exception as e:
+                return "IMPORT_FAILED", f"{type(e).__name__}: {e}"
+
         if nxt is _MISSING:
             if inspect.isclass(obj):
                 found, typ = instance_attr_type(obj, part)
@@ -253,6 +265,54 @@ def traverse(package_name, method_name):
     return "SUCCESS", obj
 
 
+_DEPRECATION_HINTS = ("Deprecat", "FutureWarning")
+
+
+def deprecation_of(obj):
+    """
+    Message if obj is marked deprecated, else None. Detects:
+      - PEP 702 @deprecated / typing_extensions.deprecated (sets __deprecated__)
+      - warnings.warn(..., <Deprecation|Future>Warning) as a top-level statement of the
+        function body (warnings inside if/for blocks are conditional, so they are ignored)
+    """
+    msg = getattr(obj, "__deprecated__", None)
+    if isinstance(msg, str) and msg:
+        return msg
+    func = obj
+    if inspect.isclass(obj):
+        func = obj.__dict__.get("__init__")
+    func = getattr(func, "__func__", func)
+    if not callable(func):
+        return None
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    except Exception:
+        return None
+    fn_node = next((n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if fn_node is None:
+        return None
+    for stmt in fn_node.body:
+        call = stmt.value if isinstance(stmt, ast.Expr) else None
+        if not isinstance(call, ast.Call):
+            continue
+        name = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", "")
+        if name != "warn":
+            continue
+        category = call.args[1] if len(call.args) > 1 else next(
+            (k.value for k in call.keywords if k.arg == "category"), None)
+        category_name = ""
+        if isinstance(category, ast.Name):
+            category_name = category.id
+        elif isinstance(category, ast.Attribute):
+            category_name = category.attr
+        if any(h in category_name for h in _DEPRECATION_HINTS):
+            text = call.args[0] if call.args else None
+            if isinstance(text, ast.Constant) and isinstance(text.value, str):
+                return text.value
+            return f"{getattr(obj, '__qualname__', 'This API')} is deprecated."
+    return None
+
+
 def main():
     package_name, method_name = sys.argv[1], sys.argv[2]
     status, obj = traverse(package_name, method_name)
@@ -264,28 +324,53 @@ def main():
         return
 
     try:
+        deprecated = deprecation_of(obj)
+    except Exception:
+        deprecated = None
+
+    try:
         sig = inspect.signature(obj)
     except ValueError:
-        emit("SIGNATURE_UNAVAILABLE")
+        emit("SIGNATURE_UNAVAILABLE", deprecated=deprecated)
         return
     except Exception:
-        emit("UNSUPPORTED_CALLABLE")
+        emit("UNSUPPORTED_CALLABLE", deprecated=deprecated)
         return
 
+    P = inspect.Parameter
     params = [n for n in sig.parameters if n not in ("self", "cls")]
     has_varkw = False
-    for param in sig.parameters.values():
-        if param.kind == inspect.Parameter.VAR_KEYWORD:
+    has_varargs = False
+    positional_names, required = [], []
+    for name, param in sig.parameters.items():
+        if name in ("self", "cls"):
+            continue
+        if param.kind == P.VAR_POSITIONAL:
+            has_varargs = True
+        elif param.kind == P.VAR_KEYWORD:
             has_varkw = True
             ann = param.annotation
-            if ann is not inspect.Parameter.empty:
+            if ann is not P.empty:
                 type_args = getattr(ann, "__args__", None)
                 target_type = type_args[0] if type_args else ann
                 if hasattr(target_type, "__annotations__"):
                     params.extend(target_type.__annotations__.keys())
                     has_varkw = False
+        else:
+            if param.kind in (P.POSITIONAL_ONLY, P.POSITIONAL_OR_KEYWORD):
+                positional_names.append(name)
+            if param.default is P.empty:
+                required.append(name)
 
-    emit("SUCCESS", valid_parameters=sorted(set(params)), accepts_kwargs=has_varkw)
+    emit(
+        "SUCCESS",
+        valid_parameters=sorted(set(params)),
+        accepts_kwargs=has_varkw,
+        positional_names=positional_names,
+        max_positional=None if has_varargs else len(positional_names),
+        required_params=required,
+        deprecated=deprecated,
+    )
 
 
 if __name__ == "__main__":
@@ -392,6 +477,8 @@ class SignatureResolver:
 
         self.runtime_provider = RuntimeProvider(verbose=verbose)
         self.stub_provider = StubProvider()
+        # One worker run per unique (package, method): large codebases repeat the same calls a lot.
+        self._cache = {}
 
         if self.target_version and self.package_to_sandbox:
             self._setup_sandbox()
@@ -431,19 +518,32 @@ class SignatureResolver:
         )
 
     def resolve(self, package_name: str, method_name: str) -> SignatureDefinition:
-        target_exec = (
-            self.sandbox_python_exec
-            if (
-                self.sandbox_dir
-                and package_name.replace("-", "_").lower()
-                == self.package_to_sandbox.replace("-", "_").lower()
+        """Signature in the TARGET version (the sandbox)."""
+        key = ("target", package_name, method_name)
+        if key not in self._cache:
+            target_exec = (
+                self.sandbox_python_exec
+                if (
+                    self.sandbox_dir
+                    and package_name.replace("-", "_").lower()
+                    == self.package_to_sandbox.replace("-", "_").lower()
+                )
+                else self.project_python_exec
             )
-            else self.project_python_exec
-        )
+            self._cache[key] = self._resolve_with(target_exec, package_name, method_name)
+        return self._cache[key]
 
-        data = self.runtime_provider.resolve(target_exec, package_name, method_name)
+    def resolve_baseline(self, package_name: str, method_name: str) -> SignatureDefinition:
+        """Signature in the CURRENTLY INSTALLED version (the project's environment)."""
+        key = ("baseline", package_name, method_name)
+        if key not in self._cache:
+            self._cache[key] = self._resolve_with(self.project_python_exec, package_name, method_name)
+        return self._cache[key]
+
+    def _resolve_with(self, python_exec: str, package_name: str, method_name: str) -> SignatureDefinition:
+        data = self.runtime_provider.resolve(python_exec, package_name, method_name)
         if self.verbose:
-            print(f"[verbose] {package_name}.{method_name} via {target_exec}: {data}")
+            print(f"[verbose] {package_name}.{method_name} via {python_exec}: {data}")
         status = data.get("status", "UNSUPPORTED_CALLABLE")
 
         if status == "SUCCESS":
@@ -454,13 +554,19 @@ class SignatureResolver:
                 is_unknown=False,
                 accepts_kwargs=data.get("accepts_kwargs", False),
                 error_code="SUCCESS",
+                positional_names=data.get("positional_names", []),
+                max_positional=data.get("max_positional"),
+                required_params=data.get("required_params", []),
+                deprecated=data.get("deprecated"),
             )
 
         # Static stubs can only help when the object exists but couldn't be inspected.
         # Never use them to overrule a definite METHOD_NOT_FOUND from the target sandbox.
         if status not in _NO_STUB_FALLBACK:
-            params = self.stub_provider.resolve(target_exec, package_name, method_name)
+            params = self.stub_provider.resolve(python_exec, package_name, method_name)
             if params is not None:
-                return SignatureDefinition(package_name, method_name, params, is_unknown=False, error_code="SUCCESS")
+                return SignatureDefinition(package_name, method_name, params, is_unknown=False,
+                                           error_code="SUCCESS", deprecated=data.get("deprecated"))
 
-        return SignatureDefinition(package_name, method_name, [], is_unknown=True, error_code=status)
+        return SignatureDefinition(package_name, method_name, [], is_unknown=True, error_code=status,
+                                   deprecated=data.get("deprecated"))

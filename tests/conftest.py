@@ -98,6 +98,41 @@ FAKE_SDK = {
             def create(self, *, model, input):
                 pass
     """,
+    # submodule that is only reachable after import: fakesdk2.tools.helper
+    "fakesdk2/__init__.py": "",
+    "fakesdk2/tools.py": "def helper(path, *, strict=False):\n    pass\n",
+    "argsdk/__init__.py": """
+        import warnings
+        try:
+            from typing_extensions import deprecated
+        except ImportError:
+            deprecated = None
+
+        def needs_region(name, region, *, timeout=None):
+            pass
+
+        def flexible(*args, **kwargs):
+            pass
+
+        def old_style(x):
+            warnings.warn("old_style() is deprecated, use new_style()", DeprecationWarning, stacklevel=2)
+
+        def conditional(x, legacy=False):
+            if legacy:
+                warnings.warn("legacy mode is deprecated", DeprecationWarning)
+
+        class Client:
+            def __init__(self, api_key, *, base_url=None):
+                pass
+
+            def send(self, payload, /, retries=3):
+                pass
+
+        if deprecated is not None:
+            @deprecated("Use Client instead")
+            def make_client():
+                pass
+    """,
     "brokensdk/__init__.py": "raise ImportError('missing optional dependency')\n",
 }
 

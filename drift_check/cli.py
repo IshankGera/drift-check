@@ -1,5 +1,8 @@
 import os
+import shlex
+import tempfile
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 import typer
@@ -13,7 +16,9 @@ from drift_check.scanner import ProjectScanner
 from drift_check.analyzer import ASTAnalyzer
 from drift_check.signatures import SignatureResolver, SandboxError
 from drift_check import probe as probe_mod
-from drift_check.rules import RuleEngine
+from drift_check import testrun, typecheck as typecheck_mod
+from drift_check.fullenv import ProjectSandbox, project_pythonpath
+from drift_check.rules import RuleEngine, suppress_consequences
 from drift_check.reporter import Reporter
 import importlib.metadata
 
@@ -61,6 +66,54 @@ def version_callback(value: bool):
     if value:
         print(f"drift-check {importlib.metadata.version('py-drift-check')}")
         raise typer.Exit()
+def establish_baseline(package: str) -> str:
+    """
+    Confirms the package is declared and that the installed version matches the declaration.
+    Returns the project's Python executable. Exits with code 2 otherwise.
+    """
+    project_python = EnvironmentDetector(".").find_python_executable()
+    console.print("[dim]Verifying environment baseline...[/dim]")
+
+    declared_specifier = DependencyDeclarationResolver(".").find(package)
+    if not declared_specifier:
+        console.print(
+            f"[bold red]❌ Error:[/bold red] Package '{package}' is not declared in "
+            f"requirements.txt, pyproject.toml or uv.lock."
+        )
+        raise typer.Exit(code=EXIT_TOOL_ERROR)
+
+    baseline = BaselineResolver(project_python).resolve(package, declared_specifier)
+    if baseline.status == BaselineStatus.NOT_INSTALLED:
+        console.print(f"[bold red]❌ Error:[/bold red] Package '{package}' is not installed in the target environment.")
+        raise typer.Exit(code=EXIT_TOOL_ERROR)
+    if baseline.status == BaselineStatus.INVALID_DECLARATION:
+        console.print(f"[bold red]❌ Error:[/bold red] Unparsable requirement declaration for '{package}'.")
+        raise typer.Exit(code=EXIT_TOOL_ERROR)
+    if baseline.status == BaselineStatus.MISMATCH:
+        console.print(
+            f"[bold red]❌ Error: Environment mismatch.[/bold red]\n"
+            f"  Declared:  {baseline.declared_specifier}\n"
+            f"  Installed: {baseline.installed_version}\n"
+            f"Please sync your environment before analyzing upgrades."
+        )
+        raise typer.Exit(code=EXIT_TOOL_ERROR)
+
+    console.print(f"[green]✓ Baseline established:[/green] {package} == {baseline.baseline_version}")
+    return project_python
+
+
+def resolve_target(package: str, to_version: str, local_wheel: Optional[str]) -> str:
+    """Normalizes --to against PyPI, or validates the local wheel. Returns the exact version."""
+    if local_wheel:
+        resolved = validate_local_wheel(local_wheel, package, to_version)
+        console.print(f"\n[dim]Bypassing PyPI, using local wheel {local_wheel}...[/dim]")
+    else:
+        console.print(f"\n[dim]Resolving target version '{to_version}' on PyPI...[/dim]")
+        resolved = PyPIResolver(package).resolve(to_version)
+    console.print(f"[green]✓ Target resolved:[/green] {resolved}")
+    return resolved
+
+
 @app.callback()
 def main(
     version: bool = typer.Option(
@@ -71,7 +124,7 @@ def main(
         help="Show the installed Drift Check version."
     )
 ):
-    """Drift Check: Proactive upgrade-impact analyzer."""
+    """Drift Check: catch breaking API changes before you upgrade (upgrade) or deploy (probe)."""
     pass
 
 @app.command()
@@ -92,48 +145,19 @@ def upgrade(
         "--verbose",
         "-v",
         help="Show detailed diagnostic information."
-    )
+    ),
+    json_report: str = typer.Option(
+        None, "--json-report", help="Also write the findings to this JSON file (for CI)."
+    ),
 ):
+    """
+    Check your code against a future version of a package, before you upgrade.
+
+    Flags methods and keyword arguments your code uses that no longer exist in the target version.
+    """
     console.print(f"[bold blue]Starting Upgrade Analysis for {package} -> {to_version}...[/bold blue]")
     
-    # 1. Environment Discovery
-    env_detector = EnvironmentDetector(".")
-    project_python = env_detector.find_python_executable()
-    
-    # 2. Baseline Resolution
-    console.print("[dim]Verifying environment baseline...[/dim]")
-    
-    # NEW: Extract the real declaration from requirements.txt
-    dec_resolver = DependencyDeclarationResolver(".")
-    declared_specifier = dec_resolver.find(package)
-    
-    if not declared_specifier:
-        console.print(f"[bold red]❌ Error:[/bold red] Package '{package}' is not declared in requirements.txt.")
-        raise typer.Exit(code=EXIT_TOOL_ERROR)
-
-    baseline_resolver = BaselineResolver(project_python)
-    baseline = baseline_resolver.resolve(package, declared_specifier)
-    
-    # Strict Halting Logic
-    if baseline.status == BaselineStatus.NOT_INSTALLED:
-        console.print(f"[bold red]❌ Error:[/bold red] Package '{package}' is not installed in the target environment.")
-        raise typer.Exit(code=EXIT_TOOL_ERROR)
-        
-    elif baseline.status == BaselineStatus.INVALID_DECLARATION:
-        console.print(f"[bold red]❌ Error:[/bold red] Unparsable requirement declaration for '{package}'.")
-        raise typer.Exit(code=EXIT_TOOL_ERROR)
-        
-    elif baseline.status == BaselineStatus.MISMATCH:
-        console.print(
-            f"[bold red]❌ Error: Environment mismatch.[/bold red]\n"
-            f"  Declared:  {baseline.declared_specifier}\n"
-            f"  Installed: {baseline.installed_version}\n"
-            f"Please sync your environment before analyzing upgrades."
-        )
-        raise typer.Exit(code=EXIT_TOOL_ERROR)
-        
-    # Execution continues only on MATCH
-    console.print(f"[green]✓ Baseline established:[/green] {package} == {baseline.baseline_version}")
+    project_python = establish_baseline(package)
 
     # 3. AST Scanning (before any network/sandbox work)
     console.print("[dim]Scanning codebase for API calls...[/dim]")
@@ -147,18 +171,11 @@ def upgrade(
 
     if not call_sites:
         console.print(f"[green]✓ No calls to '{package}' found in this project. Nothing to check.[/green]")
+        if json_report:
+            Reporter().generate_json_report([], json_report)
         return
 
-    # 4. Target Normalization (PyPI) or Local Wheel Validation
-    if local_wheel:
-        resolved_target = validate_local_wheel(local_wheel, package, to_version)
-        console.print(f"\n[dim]Bypassing PyPI, using local wheel {local_wheel}...[/dim]")
-    else:
-        console.print(f"\n[dim]Resolving target version '{to_version}' on PyPI...[/dim]")
-        pypi_resolver = PyPIResolver(package)
-        resolved_target = pypi_resolver.resolve(to_version)
-
-    console.print(f"[green]✓ Target resolved:[/green] {resolved_target}")
+    resolved_target = resolve_target(package, to_version, local_wheel)
 
     # 5. Target API Resolution & Sandboxing
     console.print(f"\n[dim]Building isolated sandbox for {package}=={resolved_target}...[/dim]")
@@ -174,17 +191,21 @@ def upgrade(
         console.print(f"[bold red]❌ Error:[/bold red] {e}")
         raise typer.Exit(code=EXIT_TOOL_ERROR)
 
-    console.print(f"[dim]Checking {len(call_sites)} call site(s)...[/dim]")
+    n_imports = sum(1 for c in call_sites if c.kind == "import")
+    console.print(f"[dim]Checking {len(call_sites) - n_imports} call(s) and {n_imports} import(s)...[/dim]")
     rule_engine = RuleEngine()
     all_findings = []
     for call in call_sites:
         sig = sig_resolver.resolve(call.package_name, call.method_name)
-        all_findings.extend(rule_engine.evaluate(call, sig))
+        baseline = None
+        # Compare with the installed version only when the target shows a problem
+        if call.kind != "import" and (RuleEngine.argument_issues(call, sig) or sig.deprecated):
+            baseline = sig_resolver.resolve_baseline(call.package_name, call.method_name)
+        all_findings.extend(rule_engine.evaluate(call, sig, baseline))
+    all_findings = suppress_consequences(all_findings)
 
     # 6. Report Generation
-    reporter = Reporter()
-    reporter.generate_console_report(all_findings)
-    # reporter.generate_json_report(all_findings) # Optional based on CLI flags
+    Reporter().report(all_findings, json_path=json_report)
     
     # 7. CI/CD Exit Code Enforcement
     has_breaking_changes = any(f.severity == "ERROR" for f in all_findings)
@@ -212,9 +233,18 @@ def probe(
     max_requests: int = typer.Option(
         20, "--max-requests", help="Safety cap on the number of unique requests sent."
     ),
+    json_report: str = typer.Option(
+        None, "--json-report", help="Also write the findings to this JSON file (for CI)."
+    ),
+    offline: bool = typer.Option(
+        False, "--offline", help="Check against built-in rules for known server changes. No API key, nothing sent."
+    ),
+    rules: str = typer.Option(
+        None, "--rules", help="Extra rules file (JSON) for --offline, in the same format as the built-in rules."
+    ),
 ):
     """
-    Check your chat.completions.create() calls against the LIVE server.
+    Check your chat.completions.create() calls against the LIVE server (or known rules with --offline).
 
     Sends one tiny request per unique (model, parameters) combination, directly from
     this machine to the provider, using your own API key. Catches server-side rejections
@@ -227,6 +257,21 @@ def probe(
     console.print("[dim]Scanning codebase for chat.completions.create() calls...[/dim]")
     py_files, _ = ProjectScanner(".").scan()
     call_sites = ASTAnalyzer(py_files, root=Path(".")).analyze()
+
+    if offline:
+        try:
+            rule_list = probe_mod.load_rules(rules)
+        except (OSError, ValueError, KeyError) as e:
+            console.print(f"[bold red]❌ Error:[/bold red] Could not load rules: {e}")
+            raise typer.Exit(code=EXIT_TOOL_ERROR)
+        findings = probe_mod.offline_findings(call_sites, rule_list, model_override=model)
+        console.print(f"[dim]Checked against {len(rule_list)} offline rule(s). Nothing was sent.[/dim]")
+        Reporter().report(findings, label="Offline rule check", json_path=json_report)
+        if any(f.severity == "ERROR" for f in findings):
+            console.print("\n[bold red]Build Failed:[/bold red] Calls match known server-side rejections.")
+            raise typer.Exit(code=EXIT_BREAKING)
+        return
+
     cases, unprobeable = probe_mod.build_cases(call_sites, model_override=model)
 
     findings = [
@@ -237,7 +282,7 @@ def probe(
     if not cases:
         reporter = Reporter()
         if findings:
-            reporter.generate_console_report(findings, label="Server probe")
+            reporter.report(findings, label="Server probe", json_path=json_report)
         else:
             console.print("[green]✓ No chat.completions.create() calls found. Nothing to probe.[/green]")
         return
@@ -261,21 +306,134 @@ def probe(
     if not api_key:
         console.print(
             f"[bold red]❌ Error:[/bold red] ${api_key_env} is not set. "
-            f"Set it, or point --api-key-env at the variable holding your key."
+            f"Set it, point --api-key-env at the variable holding your key, "
+            f"or use --offline to check known rules without a key."
         )
         raise typer.Exit(code=EXIT_TOOL_ERROR)
 
     console.print(f"[dim]Sending {len(cases)} minimal request(s) to {host} with your API key...[/dim]")
     for case in cases:
         for sent_case, result in probe_mod.run_case(base_url, api_key, case):
-            if result.status in ("AUTH_ERROR", "NETWORK_ERROR"):
+            if result.status == "AUTH_ERROR":
+                console.print(
+                    f"[bold red]❌ Error:[/bold red] {host} rejected your API key "
+                    f"(HTTP {result.http_status}): {result.message}"
+                )
+                raise typer.Exit(code=EXIT_TOOL_ERROR)
+            if result.status == "NETWORK_ERROR":
                 console.print(f"[bold red]❌ Error:[/bold red] Could not reach {host}: {result.message}")
                 raise typer.Exit(code=EXIT_TOOL_ERROR)
             findings.extend(probe_mod.findings_for(sent_case, result))
 
-    Reporter().generate_console_report(findings, label="Server probe")
+    Reporter().report(findings, label="Server probe", json_path=json_report)
     if any(f.severity == "ERROR" for f in findings):
         console.print("\n[bold red]Build Failed:[/bold red] The server rejects calls made by this code.")
+        raise typer.Exit(code=EXIT_BREAKING)
+
+
+@app.command()
+def typecheck(
+    package: str = typer.Argument(..., help="The package to analyze (e.g., pydantic)"),
+    to_version: str = typer.Option(..., "--to", help="Target version to check against"),
+    local_wheel: str = typer.Option(None, "--local-wheel", help="Local wheel to use instead of PyPI"),
+    json_report: str = typer.Option(None, "--json-report", help="Also write the findings to this JSON file."),
+):
+    """
+    Type-check your project before and after the upgrade, and report only NEW type errors.
+
+    Catches what the call-site check cannot see, such as methods on your own subclasses of the
+    package's classes. Needs your project's dependencies installed (they are copied to a sandbox).
+    """
+    console.print(f"[bold blue]Type-check diff for {package} -> {to_version}...[/bold blue]")
+    project_python = establish_baseline(package)
+    resolved_target = resolve_target(package, to_version, local_wheel)
+
+    console.print("\n[dim]Building a sandbox with your project's packages and the new version "
+                  "(this can take a minute)...[/dim]")
+    sandbox = None
+    try:
+        sandbox = ProjectSandbox(project_python, package, resolved_target, local_wheel).build()
+        findings = typecheck_mod.check(sandbox.uv, project_python, sandbox.python, Path(".").resolve(), package,
+                                       log=lambda m: console.print(f"[dim]{m}[/dim]"))
+    except (SandboxError, typecheck_mod.TypeCheckError) as e:
+        console.print(f"[bold red]❌ Error:[/bold red] {e}")
+        raise typer.Exit(code=EXIT_TOOL_ERROR)
+    finally:
+        if sandbox:
+            sandbox.cleanup()
+
+    Reporter().report(findings, label="Type-check diff", json_path=json_report)
+    if any(f.severity == "ERROR" for f in findings):
+        console.print("\n[bold red]Build Failed:[/bold red] The upgrade introduces new type errors.")
+        raise typer.Exit(code=EXIT_BREAKING)
+
+
+@app.command("test")
+def test_command(
+    package: str = typer.Argument(..., help="The package to analyze (e.g., openai)"),
+    to_version: str = typer.Option(..., "--to", help="Target version to check against"),
+    local_wheel: str = typer.Option(None, "--local-wheel", help="Local wheel to use instead of PyPI"),
+    pytest_args: str = typer.Option("", "--pytest-args", help='Extra pytest arguments, e.g. "tests/unit -x"'),
+    coverage_risk: bool = typer.Option(
+        True, "--coverage-risk/--no-coverage-risk",
+        help="Also list calls into the package that no test runs."
+    ),
+    json_report: str = typer.Option(None, "--json-report", help="Also write the findings to this JSON file."),
+):
+    """
+    Run your tests with the upgraded package and compare with today.
+
+    Reports tests that start failing, new deprecation warnings, and calls into the package
+    that no test executes (where a break would go unnoticed).
+    """
+    console.print(f"[bold blue]Test run for {package} -> {to_version}...[/bold blue]")
+    project_python = establish_baseline(package)
+    resolved_target = resolve_target(package, to_version, local_wheel)
+    root = Path(".").resolve()
+    pythonpath = project_pythonpath(root)
+    args = shlex.split(pytest_args)
+
+    baseline_run = None
+    if testrun.has_pytest(project_python):
+        console.print("\n[dim]Running your tests with your current versions...[/dim]")
+        baseline_run = testrun.run_pytest(project_python, root, pythonpath, args)
+    else:
+        console.print("\n[yellow]pytest is not installed in your environment, so there is no baseline run. "
+                      "Failures are reported without checking whether they also fail today.[/yellow]")
+
+    console.print("[dim]Building a sandbox with your project's packages and the new version...[/dim]")
+    sandbox = None
+    try:
+        extras = ["pytest", "coverage"] if coverage_risk else ["pytest"]
+        sandbox = ProjectSandbox(project_python, package, resolved_target, local_wheel, extras).build()
+        console.print("[dim]Running your tests with the upgraded version...[/dim]")
+        with tempfile.TemporaryDirectory(prefix="drift-check-cov-") as tmp:
+            cov_file = Path(tmp) / ".coverage" if coverage_risk else None
+            target_run = testrun.run_pytest(sandbox.python, root, pythonpath, args, coverage_file=cov_file)
+            executed = testrun.coverage_json(sandbox.python, cov_file, root) if coverage_risk else None
+    except SandboxError as e:
+        console.print(f"[bold red]❌ Error:[/bold red] {e}")
+        raise typer.Exit(code=EXIT_TOOL_ERROR)
+    finally:
+        if sandbox:
+            sandbox.cleanup()
+
+    if not target_run.ran:
+        console.print("[bold red]❌ Error:[/bold red] pytest did not run in the sandbox.\n" + target_run.output)
+        raise typer.Exit(code=EXIT_TOOL_ERROR)
+
+    call_sites = []
+    if coverage_risk:
+        py_files, _ = ProjectScanner(".").scan()
+        call_sites = [c for c in ASTAnalyzer(py_files, root=Path(".")).analyze()
+                      if normalize_name(c.package_name) == normalize_name(package)]
+
+    console.print(f"[dim]{target_run.total} test(s) run with the upgraded version"
+                  + (f", {baseline_run.total} with your current version." if baseline_run else ".") + "[/dim]")
+    findings = testrun.build_findings(package, baseline_run, target_run, root, call_sites, executed)
+    Reporter().report(findings, label="Test run", json_path=json_report)
+    if any(f.severity == "ERROR" for f in findings):
+        console.print("\n[bold red]Build Failed:[/bold red] Tests break with the upgraded version.")
         raise typer.Exit(code=EXIT_BREAKING)
 
 

@@ -75,7 +75,11 @@ class ProbeResult:
 
 
 def is_chat_call(call: CallSite) -> bool:
-    return call.package_name == "openai" and call.method_name.endswith(CHAT_METHOD_SUFFIXES)
+    return (
+        call.kind == "call"
+        and call.package_name == "openai"
+        and call.method_name.endswith(CHAT_METHOD_SUFFIXES)
+    )
 
 
 def build_cases(call_sites: List[CallSite], model_override: Optional[str] = None):
@@ -211,3 +215,49 @@ def run_case(base_url: str, api_key: str, case: ProbeCase, max_rounds: int = 5) 
                             [p for p in current.literal_params if p != result.param],
                             current.skipped_params, current.call_sites)
     return rounds
+
+
+# ---------------------------------------------------------------- offline rules (no API key)
+
+def load_rules(extra_path: Optional[str] = None) -> List[dict]:
+    """Built-in rules, plus a user-provided JSON file in the same format."""
+    import re as _re
+    from pathlib import Path
+
+    builtin = Path(__file__).parent / "data" / "llm_rules.json"
+    rules = json.loads(builtin.read_text(encoding="utf-8"))["rules"]
+    if extra_path:
+        with open(extra_path, "r", encoding="utf-8") as f:
+            rules = rules + json.load(f)["rules"]
+    for rule in rules:
+        _re.compile(rule["models"])  # fail early on a bad pattern
+    return rules
+
+
+def offline_findings(call_sites: List[CallSite], rules: List[dict],
+                     model_override: Optional[str] = None) -> List[Finding]:
+    """Checks chat calls against known server rules, without sending anything."""
+    import re as _re
+
+    findings: List[Finding] = []
+    for call in call_sites:
+        if not is_chat_call(call):
+            continue
+        model = model_override or call.literal_kwargs.get("model")
+        if not isinstance(model, str):
+            findings.append(Finding("WARNING", call.file_path, call.line_number, call.package_name,
+                                    call.method_name, "Model is not a literal in the code. Pass --model to check it."))
+            continue
+        for rule in rules:
+            if rule["param"] not in call.kwargs_passed or not _re.search(rule["models"], model):
+                continue
+            allowed = rule.get("allowed_values")
+            if allowed is not None:
+                if rule["param"] not in call.literal_kwargs:
+                    continue  # value unknown statically: no claim either way
+                if call.literal_kwargs[rule["param"]] in allowed:
+                    continue
+            findings.append(Finding(rule.get("severity", "WARNING"), call.file_path, call.line_number,
+                                    call.package_name, call.method_name,
+                                    f"Model '{model}': {rule['message']} (offline rule {rule['id']})"))
+    return findings
