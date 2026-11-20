@@ -139,3 +139,43 @@ def test_deprecated_import_reported_once():
         Finding("WARNING", "b.py", 4, "sdk", "old", "Deprecated in the target version: x"),
     ]
     assert [(f.file_path, f.line_number) for f in suppress_consequences(findings)] == [("a.py", 1), ("b.py", 4)]
+
+
+# ---------- v0.4.1: compare every problem with today's version (independent review, bug 4) ----------
+
+def test_method_missing_in_both_versions_is_not_reported():
+    missing = sig(unknown=True, code="METHOD_NOT_FOUND")
+    assert RuleEngine().evaluate(pcall(), missing, baseline=missing) == []
+
+
+def test_method_removed_by_upgrade_is_error():
+    [f] = RuleEngine().evaluate(pcall(), sig(unknown=True, code="METHOD_NOT_FOUND"), baseline=sig(**V1))
+    assert f.severity == "ERROR"
+
+
+def test_kwarg_invalid_in_both_versions_is_not_reported():
+    assert RuleEngine().evaluate(pcall(1, ["retries"]), sig(**V1), baseline=sig(**V1)) == []
+
+
+def test_kwarg_removed_by_upgrade_is_error():
+    old = dict(V1, params=["a", "b", "retries"])
+    [f] = RuleEngine().evaluate(pcall(1, ["retries"]), sig(**V1), baseline=sig(**old))
+    assert f.severity == "ERROR" and "'retries'" in f.message
+
+
+def test_import_missing_in_both_versions_is_not_reported():
+    missing = sig(unknown=True, code="METHOD_NOT_FOUND")
+    assert RuleEngine().evaluate(imp("NewThing"), missing, baseline=missing) == []
+
+
+def test_guarded_import_is_only_a_warning():
+    call = CallSite("app.py", 2, "sdk", "NewThing", [], False, kind="import", guarded=True)
+    [f] = RuleEngine().evaluate(call, sig(unknown=True, code="METHOD_NOT_FOUND"), baseline=sig())
+    assert f.severity == "WARNING" and "fallback" in f.message
+
+
+def test_needs_baseline():
+    assert RuleEngine.needs_baseline(pcall(), sig(unknown=True, code="METHOD_NOT_FOUND"))
+    assert RuleEngine.needs_baseline(pcall(0, ["x"]), sig(params=["a"]))
+    assert not RuleEngine.needs_baseline(pcall(0, ["a"]), sig(params=["a"]))
+    assert not RuleEngine.needs_baseline(pcall(0, ["x"]), sig(params=["a"], varkw=True))

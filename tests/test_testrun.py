@@ -77,3 +77,10 @@ def test_sandbox_freeze_filter(tmp_path, monkeypatch):
     assert sb._keep("httpx==0.27.0")
     assert sb._keep("mypkg @ file:///wheels/mypkg.whl")
     sb.cleanup()
+
+
+def test_call_on_continuation_line_counts_as_covered(tmp_path):
+    # Independent review, bug 13: coverage only lists the statement's first line
+    app = str(tmp_path / "app.py")
+    call = CallSite(app, 5, "sdk", "dumps", [], False, statement_line=4)
+    assert testrun.uncovered_call_sites([call], {os.path.realpath(app): {1, 4}}) == []

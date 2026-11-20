@@ -100,39 +100,17 @@ class DependencyDeclarationResolver:
         return deps
 
     def _find_in_requirements(self, target_name: str) -> Optional[str]:
-        req_file = self.target_dir / "requirements.txt"
-        if not req_file.exists():
-            return None
-
-        with open(req_file, "r", encoding="utf-8-sig") as f:
-            for line in f:
-                line = line.split(" #")[0].strip()
-                # Skip comments and pip options such as -r, -e, --index-url
-                if not line or line.startswith(("#", "-")):
-                    continue
-
-                # Extract the base package name from the line (dots allowed: zope.interface)
-                match = re.match(r"^([a-zA-Z0-9_\-.]+)", line)
-                if match and canonicalize(match.group(1)) == target_name:
-                    return line  # Returns the full string, e.g., "openai>=1.50.0"
-                        
-        return None
+        return self.requirements_dependencies().get(target_name)
 
     def requirements_dependencies(self) -> Dict[str, str]:
         req_file = self.target_dir / "requirements.txt"
         if not req_file.exists():
             return {}
-
-        deps = {}
-        with open(req_file, "r", encoding="utf-8-sig") as f:
-            for line in f:
-                line = line.strip()
-                # Skip comments and pip options such as -r, -e, --index-url
-                if not line or line.startswith(("#", "-")):
-                    continue
-                match = re.match(r"^([a-zA-Z0-9_\-.]+)", line)
-                if match:
-                    deps.setdefault(canonicalize(match.group(1)), line)
+        deps: Dict[str, str] = {}
+        for line in requirement_lines(req_file.read_text(encoding="utf-8-sig")):
+            match = re.match(r"^([a-zA-Z0-9_\-.]+)", line)
+            if match:
+                deps.setdefault(canonicalize(match.group(1)), line)
         return deps
 
     def pyproject_dependencies(self) -> Dict[str, str]:
@@ -185,6 +163,22 @@ class DependencyDeclarationResolver:
                 return tomllib.load(f)
         except (tomllib.TOMLDecodeError, OSError):
             return None
+
+
+def requirement_lines(text: str):
+    """
+    Yields plain requirement strings from a requirements.txt, as written by hand or by
+    pip-compile / uv pip compile: joins `\\` continuations, drops comments, drops options
+    such as `--hash=sha256:...`, and skips option lines (-r, -e, --index-url, ...).
+    """
+    joined = re.sub(r"\\\r?\n", " ", text)
+    for raw in joined.splitlines():
+        line = re.sub(r"(^|\s)#.*$", "", raw).strip()
+        if not line or line.startswith("-"):
+            continue
+        line = re.sub(r"\s+--[\w-]+(?:[= ]\S+)?", "", line).strip()
+        if line:
+            yield line
 
 
 def canonicalize(name: str) -> str:

@@ -44,14 +44,27 @@ class PyPIResolver:
         Validates the requested version against PyPI.
         Prompts the user if an exact match isn't found but a valid patch exists.
         """
-        normalized = self.normalize_version(requested_version)
         releases = self.fetch_releases()
 
-        # 1. Exact Match
-        if normalized in releases:
-            return normalized
+        # 1. Exact match, as published ("5.1", "2024.1", "1.50.0")
+        requested = requested_version.strip()
+        if requested in releases:
+            return requested
 
-        # 2. Match not found - search for closest valid patch release
+        # 2. Same version written differently: "5.1" == "5.1.0", "1.50" == "1.50.0"
+        normalized = self.normalize_version(requested)
+        try:
+            wanted = Version(requested)
+            for r in releases:
+                try:
+                    if Version(r) == wanted:
+                        return r
+                except InvalidVersion:
+                    continue
+        except InvalidVersion:
+            pass
+
+        # 3. Not published - search for the closest patch release
         try:
             req_v = Version(normalized)
         except InvalidVersion:
@@ -64,7 +77,7 @@ class PyPIResolver:
                 v = Version(r)
                 # Look for releases in the same major.minor line that aren't pre-releases
                 if not v.is_prerelease and v.major == req_v.major and v.minor == req_v.minor:
-                    valid_patches.append(v)
+                    valid_patches.append((v, r))
             except InvalidVersion:
                 continue
 
@@ -72,9 +85,9 @@ class PyPIResolver:
             console.print(f"[bold red]❌ Error:[/bold red] Release {normalized} not found, and no alternative patches exist for this version line.")
             raise typer.Exit(code=2)
 
-        best_match = str(max(valid_patches))
+        best_match = max(valid_patches)[1]  # the release string exactly as published
         
-        # 3. Interactive Prompt (never prompt in CI / non-interactive shells)
+        # 4. Interactive prompt (never prompt in CI / non-interactive shells)
         if not sys.stdin.isatty():
             console.print(
                 f"[bold red]❌ Error:[/bold red] Release {normalized} not found. "

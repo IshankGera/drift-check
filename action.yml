@@ -28,16 +28,19 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Install drift-check into the project's Python
+    - name: Install drift-check
       shell: bash
       env:
         DC_VERSION: ${{ inputs.drift-check-version }}
       run: |
-        # Installed next to the project's dependencies so the baseline version is visible.
-        if [ -n "$DC_VERSION" ]; then
-          python -m pip install --quiet "py-drift-check==$DC_VERSION"
+        spec="py-drift-check"
+        [ -n "$DC_VERSION" ] && spec="py-drift-check==$DC_VERSION"
+        if command -v pipx >/dev/null 2>&1; then
+          # Isolated install: drift-check's own dependencies never change the project's versions.
+          pipx install --force "$spec"
+          echo "DRIFT_CHECK_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
         else
-          python -m pip install --quiet py-drift-check
+          python -m pip install --quiet "$spec"
         fi
 
     - name: Check each upgrade

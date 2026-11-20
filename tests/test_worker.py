@@ -134,3 +134,37 @@ def test_pep702_deprecated_detected(worker):
         import pytest
         pytest.skip("typing_extensions not installed")
     assert r["deprecated"] == "Use Client instead"
+
+
+# ---------- v0.4.1 regressions ----------
+
+def test_kwargs_any_still_accepts_anything(worker):
+    # Bug: on Python 3.11+, typing.Any has __annotations__, so **kwargs: Any looked closed
+    r = worker("reviewsdk", "anykw")
+    assert r["accepts_kwargs"] is True
+
+
+def test_unpack_typeddict_lists_exact_keys(worker):
+    r = worker("reviewsdk", "typed_kw")
+    assert r["accepts_kwargs"] is False
+    assert set(r["valid_parameters"]) == {"model", "temperature", "top_p"}
+
+
+def test_real_cls_parameter_is_kept(worker):
+    # Bug: parameters named cls/self were dropped everywhere
+    assert "cls" in worker("reviewsdk", "dumps")["valid_parameters"]
+
+
+def test_method_self_dropped_but_classmethod_and_staticmethod_shapes(worker):
+    send = worker("reviewsdk", "Client.send")
+    assert send["positional_names"] == ["payload", "retries"] and send["required_params"] == ["payload"]
+    assert worker("reviewsdk", "Client.build")["positional_names"] == ["region"]
+    assert worker("reviewsdk", "Client.helper")["positional_names"] == ["x"]
+
+
+def test_class_attribute_default_none_follows_annotation(worker):
+    # Bug: `session: Optional[Session] = None` made Client.session.get METHOD_NOT_FOUND
+    for path in ("Client.session.get", "Cfg.session.get", "Slotted.session.get"):
+        r = worker("reviewsdk", path)
+        assert r["status"] == "SUCCESS", path
+        assert r["valid_parameters"] == ["timeout", "url"], path

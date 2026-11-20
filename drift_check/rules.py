@@ -18,22 +18,24 @@ class RuleEngine:
         """
         Compares one call site with the target version's signature.
 
-        `baseline` is the signature in the currently installed version. When given, argument
-        problems (missing required / too many positional) are only reported if the baseline
-        accepted the call. That keeps the report to what the upgrade itself breaks.
+        `baseline` is the signature in the currently installed version. When given, every
+        problem is only reported if today's version does not have it too. That keeps the
+        report to what the upgrade itself breaks, and filters out analysis mistakes.
         """
         def finding(severity: str, message: str) -> Finding:
             return Finding(severity, call.file_path, call.line_number,
                            call.package_name, call.method_name, message, kind=call.kind)
 
         if call.kind == "import":
-            return self._evaluate_import(call, sig, finding)
+            return self._evaluate_import(call, sig, baseline, finding)
 
         findings: List[Finding] = []
 
         # 1. Does the method still exist?
         if sig.is_unknown:
             if sig.error_code == "METHOD_NOT_FOUND":
+                if baseline is not None and baseline.error_code == "METHOD_NOT_FOUND":
+                    return []  # does not resolve today either: already broken, or not really a package call
                 return [finding("ERROR", f"Method '{sig.method_name}' no longer exists in the target version.")]
             if sig.error_code == "PACKAGE_NOT_INSTALLED":
                 findings.append(finding("WARNING", f"Failed to inspect target sandbox for '{sig.package_name}'."))
@@ -69,6 +71,9 @@ class RuleEngine:
                 if call.kind != "constructor":
                     findings.append(finding("WARNING", f"Parameter '{kwarg}' could not be verified. "
                                                        "Target API accepts dynamic **kwargs. (Confidence: LOW)"))
+            elif baseline is not None and not baseline.is_unknown \
+                    and kwarg not in baseline.valid_parameters and not baseline.accepts_kwargs:
+                continue  # not accepted today either: not caused by the upgrade
             else:
                 findings.append(finding("ERROR", f"Parameter '{kwarg}' is no longer supported."))
 
@@ -109,15 +114,32 @@ class RuleEngine:
             message = message[:197] + "..."
         return [finding("WARNING", f"Deprecated in the target version{note}: {message}")]
 
-    def _evaluate_import(self, call, sig, finding) -> List[Finding]:
+    def _evaluate_import(self, call, sig, baseline, finding) -> List[Finding]:
         """Imports only need to exist in the target version."""
         if sig.error_code == "METHOD_NOT_FOUND":
+            if baseline is not None and baseline.error_code == "METHOD_NOT_FOUND":
+                return []  # does not exist today either: not caused by the upgrade
+            if call.guarded:
+                return [finding("WARNING", f"Import '{call.method_name}' from '{call.package_name}' no longer exists in "
+                                           f"the target version. It is inside try/except ImportError, so your "
+                                           f"fallback will be used: check that the fallback still works.")]
             return [finding("ERROR", f"Import '{call.method_name}' from '{call.package_name}' "
                                      f"no longer exists in the target version.")]
         if sig.error_code == "IMPORT_FAILED":
             return [finding("WARNING", f"'{call.package_name}' could not be imported in the target sandbox. "
                                        f"Cannot verify this import.")]
-        return self._deprecation(sig, None, finding)
+        return self._deprecation(sig, baseline, finding)
+
+    @staticmethod
+    def needs_baseline(call: CallSite, sig: SignatureDefinition) -> bool:
+        """True when the target version shows a problem that must be confirmed against today's version."""
+        if sig.error_code == "METHOD_NOT_FOUND" or sig.deprecated:
+            return True
+        if call.kind == "import" or sig.is_unknown:
+            return False
+        if not sig.accepts_kwargs and any(k not in sig.valid_parameters for k in call.kwargs_passed):
+            return True
+        return bool(RuleEngine.argument_issues(call, sig))
 
 
 def suppress_consequences(findings: List[Finding]) -> List[Finding]:

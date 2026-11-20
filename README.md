@@ -34,7 +34,7 @@ All commands share the same exit codes, so they drop straight into CI:
 
 ## 💻 Quickstart
 
-Run from your project folder, with its virtual environment present (`.venv`, `venv`, `env`, or an activated one):
+Run from your project folder, with its virtual environment present (`.venv`, `venv`, `env`, or an activated one). To point at a different interpreter, set `DRIFT_CHECK_PYTHON=/path/to/python`.
 
 ```bash
 drift-check upgrade openai --to 2.0.0

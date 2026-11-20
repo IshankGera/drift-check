@@ -9,9 +9,15 @@ class EnvironmentDetector:
     def find_python_executable(self) -> str:
         """
         Finds the most appropriate Python interpreter for the target project.
-        Search order: VIRTUAL_ENV variable -> .venv/ -> venv/ -> env/ -> sys.executable
+        Search order: DRIFT_CHECK_PYTHON -> VIRTUAL_ENV -> .venv/ -> venv/ -> env/ -> sys.executable
         """
         
+        # 0. Explicit override, e.g. set by the GitHub Action when drift-check is installed
+        #    in its own isolated environment (pipx / uv tool)
+        override = os.environ.get("DRIFT_CHECK_PYTHON")
+        if override and Path(override).exists():
+            return override
+
         # 1. Check for an actively sourced virtual environment
         active_venv = os.environ.get("VIRTUAL_ENV")
         if active_venv:

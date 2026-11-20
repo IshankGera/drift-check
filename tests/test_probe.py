@@ -202,3 +202,52 @@ def test_cli_offline_needs_no_key(project, monkeypatch):
     result = CliRunner().invoke(app, ["probe", "--offline"])
     assert result.exit_code == 1, result.output
     assert "max_completion_tokens" in result.output and "Nothing was sent" in result.output
+
+
+# ---------- v0.4.1: redirects and odd error bodies (independent review, bugs 11 and 12) ----------
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+def test_redirect_is_not_followed_and_key_not_resent():
+    received = []
+
+    class Target(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append(self.headers.get("Authorization"))
+            self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+        do_POST = do_GET
+
+        def log_message(self, *a):
+            pass
+
+    target = HTTPServer(("127.0.0.1", 0), Target)
+    threading.Thread(target=target.serve_forever, daemon=True).start()
+
+    class Redirector(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target.server_port}/steal")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    redirector = HTTPServer(("127.0.0.1", 0), Redirector)
+    threading.Thread(target=redirector.serve_forever, daemon=True).start()
+    try:
+        (case,), _ = probe.build_cases([chat("gpt-4o")])
+        result = probe.send_probe(f"http://127.0.0.1:{redirector.server_port}/v1", "sk-SECRET", case, timeout=5)
+        assert result.status == "INCONCLUSIVE" and "Not followed" in result.message
+        assert received == []
+    finally:
+        redirector.shutdown(); target.shutdown()
+
+
+@pytest.mark.parametrize("body", ['{"error": null}', '{"error": {"message": null}}', "[1, 2]",
+                                  "<html>Bad Gateway</html>", '{"error": {"message": {"nested": 1}}}', ""])
+def test_odd_error_bodies_do_not_crash(body):
+    result = probe.classify_error(400, body)
+    assert result.status == "REJECTED" and isinstance(result.message, str) and result.message

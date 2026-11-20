@@ -43,6 +43,16 @@ def module_name_for(path: Path, root: Path) -> Optional[str]:
     return ".".join(parts) if parts else None
 
 
+# A name in a scope is bound to one of:
+#   ("import", (package, path))   e.g. `from openai import OpenAI`
+#   ("instance", (package, path)) e.g. `client = OpenAI()`
+#   ("other", None)               anything else: shadows outer bindings of the same name
+Binding = Tuple[str, Any]
+OTHER: Binding = ("other", None)
+
+_IMPORT_GUARDS = {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
+
+
 class CallSiteVisitor(ast.NodeVisitor):
     def __init__(
         self,
@@ -56,18 +66,61 @@ class CallSiteVisitor(ast.NodeVisitor):
         self.project_instances = project_instances or {}
 
         self.call_sites: List[CallSite] = []
-        # Local name -> (top-level package, dotted path inside it).
-        #   import openai                      -> {"openai": ("openai", "")}
-        #   import openai.types as t           -> {"t": ("openai", "types")}
-        #   from openai.lib.azure import Azure -> {"Azure": ("openai", "lib.azure.Azure")}
-        self.imports: Dict[str, Tuple[str, str]] = {}
-        # Variable -> instance. {"client": ("openai", "OpenAI")}
-        self.assignments: Dict[str, Instance] = {}
-        # self.<attr> -> instance. {"client": ("openai", "OpenAI")}
-        self.self_assignments: Dict[str, Instance] = {}
+        # Scope stack, innermost last: (kind, {name: Binding}); kind is module/function/class
+        self._scopes: List[Tuple[str, Dict[str, Binding]]] = [("module", {})]
+        # Per class: {attr: Instance or None}, for self.<attr> inside its methods
+        self._class_attrs: List[Dict[str, Optional[Instance]]] = []
+        # Name of `self` in the current method (None outside methods)
+        self._self_names: List[Optional[str]] = [None]
         # Module-level instances defined in THIS file (exported for cross-file tracing)
         self.module_instances: Dict[str, Instance] = {}
-        self._depth = 0  # 0 = module level
+        self._guard_depth = 0        # > 0 inside `try:` blocks that catch ImportError
+        self._statement_line = 0     # first line of the statement being visited
+
+    # ---------- symbol table ----------
+
+    def _bind(self, name: str, binding: Binding):
+        kind, table = self._scopes[-1]
+        table[name] = binding
+        if kind == "module":
+            if binding[0] == "instance":
+                self.module_instances[name] = binding[1]
+            else:
+                self.module_instances.pop(name, None)
+
+    def _lookup(self, name: str) -> Optional[Binding]:
+        # Like Python: class bodies are not visible from inside their methods
+        for i in range(len(self._scopes) - 1, -1, -1):
+            kind, table = self._scopes[i]
+            if kind == "class" and i != len(self._scopes) - 1:
+                continue
+            if name in table:
+                return table[name]
+        return None
+
+    def _import(self, name: str) -> Optional[Tuple[str, str]]:
+        b = self._lookup(name)
+        return b[1] if b and b[0] == "import" else None
+
+    def _instance(self, name: str) -> Optional[Instance]:
+        b = self._lookup(name)
+        return b[1] if b and b[0] == "instance" else None
+
+    def _self_attr(self, attr: str) -> Optional[Instance]:
+        if not self._class_attrs:
+            return None
+        return self._class_attrs[-1].get(attr)
+
+    # ---------- statements ----------
+
+    def visit(self, node):
+        if isinstance(node, ast.stmt):
+            previous, self._statement_line = self._statement_line, node.lineno
+            try:
+                return super().visit(node)
+            finally:
+                self._statement_line = previous
+        return super().visit(node)
 
     # ---------- imports ----------
 
@@ -75,17 +128,18 @@ class CallSiteVisitor(ast.NodeVisitor):
         """Every imported name below the package root must still exist in the target version."""
         if path:
             self.call_sites.append(CallSite(
-                file_path=self.file_path, line_number=node.lineno, package_name=package,
+                file_path=self.file_path, line_number=getattr(node, "lineno", 0), package_name=package,
                 method_name=path, kwargs_passed=[], has_dynamic_kwargs=False, kind="import",
+                guarded=self._guard_depth > 0, statement_line=self._statement_line,
             ))
 
     def visit_Import(self, node: ast.Import):
         for alias in node.names:
             top, _, rest = alias.name.partition(".")
             if alias.asname:
-                self.imports[alias.asname] = (top, rest)   # import a.b as c -> c is a.b
+                self._bind(alias.asname, ("import", (top, rest)))   # import a.b as c -> c is a.b
             else:
-                self.imports[top] = (top, "")              # import a.b      -> name `a` is bound
+                self._bind(top, ("import", (top, "")))              # import a.b      -> name `a` is bound
             self._record_import_site(node, top, rest)
         self.generic_visit(node)
 
@@ -98,12 +152,14 @@ class CallSiteVisitor(ast.NodeVisitor):
             # `from svc.llm import client` where svc.llm defines `client = OpenAI()`
             exported = self.project_instances.get(source_module or "", {})
             if alias.name in exported:
-                self.assignments[local_name] = exported[alias.name]
+                self._bind(local_name, ("instance", exported[alias.name]))
             elif node.level == 0 and node.module:
                 top, _, rest = node.module.partition(".")
                 path = ".".join(p for p in (rest, alias.name) if p)
-                self.imports[local_name] = (top, path)
+                self._bind(local_name, ("import", (top, path)))
                 self._record_import_site(node, top, path)
+            else:
+                self._bind(local_name, OTHER)  # project-local import
         self.generic_visit(node)
 
     def _resolve_from_module(self, node: ast.ImportFrom) -> Optional[str]:
@@ -115,22 +171,135 @@ class CallSiteVisitor(ast.NodeVisitor):
         base = self.module_name.split(".")
         is_package = self.file_path.endswith("__init__.py")
         drop = node.level - (1 if is_package else 0)
-        base = base[: len(base) - drop] if drop > 0 else base
-        if drop > len(self.module_name.split(".")):
+        if drop > len(base):
             return None
+        base = base[: len(base) - drop] if drop > 0 else base
         parts = base + ([node.module] if node.module else [])
         return ".".join(p for p in parts if p)
 
+    def _visit_try(self, node):
+        guarded = any(
+            h.type is None or self._exception_names(h.type) & _IMPORT_GUARDS for h in node.handlers
+        )
+        if guarded:
+            self._guard_depth += 1
+        for stmt in node.body:
+            self.visit(stmt)
+        if guarded:
+            self._guard_depth -= 1
+        for part in (node.handlers, node.orelse, node.finalbody):
+            for child in part:
+                self.visit(child)
+
+    visit_Try = _visit_try
+    visit_TryStar = _visit_try
+
+    @staticmethod
+    def _exception_names(expr: ast.expr) -> set:
+        nodes = expr.elts if isinstance(expr, ast.Tuple) else [expr]
+        names = set()
+        for n in nodes:
+            if isinstance(n, ast.Name):
+                names.add(n.id)
+            elif isinstance(n, ast.Attribute):
+                names.add(n.attr)
+        return names
+
     # ---------- scopes ----------
 
-    def _visit_scope(self, node):
-        self._depth += 1
-        self.generic_visit(node)
-        self._depth -= 1
+    @staticmethod
+    def _arg_names(args: ast.arguments) -> List[str]:
+        names = [a.arg for a in getattr(args, "posonlyargs", []) + args.args + args.kwonlyargs]
+        if args.vararg:
+            names.append(args.vararg.arg)
+        if args.kwarg:
+            names.append(args.kwarg.arg)
+        return names
 
-    visit_FunctionDef = _visit_scope
-    visit_AsyncFunctionDef = _visit_scope
-    visit_ClassDef = _visit_scope
+    def _visit_function(self, node):
+        # Decorators, defaults and annotations are evaluated in the enclosing scope
+        for expr in node.decorator_list + node.args.defaults + [d for d in node.args.kw_defaults if d]:
+            self.visit(expr)
+        in_class = self._scopes[-1][0] == "class"
+        is_static = any(isinstance(d, ast.Name) and d.id == "staticmethod" for d in node.decorator_list)
+        positional = [a.arg for a in getattr(node.args, "posonlyargs", []) + node.args.args]
+        self_name = positional[0] if in_class and not is_static and positional else None
+
+        self._scopes.append(("function", {}))
+        self._self_names.append(self_name if in_class else self._self_names[-1])
+        for name in self._arg_names(node.args):
+            self._bind(name, OTHER)  # parameters shadow imports/instances with the same name
+        for stmt in node.body:
+            self.visit(stmt)
+        self._self_names.pop()
+        self._scopes.pop()
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+
+    def visit_Lambda(self, node: ast.Lambda):
+        for expr in node.args.defaults + [d for d in node.args.kw_defaults if d]:
+            self.visit(expr)
+        self._scopes.append(("function", {}))
+        for name in self._arg_names(node.args):
+            self._bind(name, OTHER)
+        self.visit(node.body)
+        self._scopes.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        for expr in node.decorator_list + node.bases + [k.value for k in node.keywords]:
+            self.visit(expr)
+        self._class_attrs.append(self._collect_self_attrs(node))
+        self._scopes.append(("class", {}))
+        for stmt in node.body:
+            self.visit(stmt)
+        self._scopes.pop()
+        self._class_attrs.pop()
+        self._bind(node.name, OTHER)
+
+    def _collect_self_attrs(self, cls: ast.ClassDef) -> Dict[str, Optional[Instance]]:
+        """
+        self.<attr> assignments in all methods of the class, collected up front so methods
+        can use attributes set in __init__ wherever they appear. An attribute assigned
+        anything that is not a package constructor is not tracked (None).
+        """
+        attrs: Dict[str, Optional[Instance]] = {}
+        for method in cls.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            positional = [a.arg for a in getattr(method.args, "posonlyargs", []) + method.args.args]
+            if not positional:
+                continue
+            self_name = positional[0]
+            for node in ast.walk(method):
+                targets, value = [], None
+                if isinstance(node, ast.Assign):
+                    targets, value = node.targets, node.value
+                elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                    targets, value = [node.target], node.value
+                for t in targets:
+                    if (isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
+                            and t.value.id == self_name):
+                        instance = self._instance_from_constructor(value) if value is not None else None
+                        if t.attr in attrs and attrs[t.attr] != instance:
+                            attrs[t.attr] = None  # assigned different things: ambiguous
+                        else:
+                            attrs[t.attr] = instance
+        return attrs
+
+    def _visit_comprehension(self, node):
+        # Comprehension variables live in their own scope and shadow outer names
+        self._scopes.append(("function", {}))
+        for gen in node.generators:
+            for target in self._target_names(gen.target):
+                self._bind(target, OTHER)
+        self.generic_visit(node)
+        self._scopes.pop()
+
+    visit_ListComp = _visit_comprehension
+    visit_SetComp = _visit_comprehension
+    visit_DictComp = _visit_comprehension
+    visit_GeneratorExp = _visit_comprehension
 
     # ---------- instance tracking ----------
 
@@ -138,47 +307,94 @@ class CallSiteVisitor(ast.NodeVisitor):
     def _join(*parts: str) -> str:
         return ".".join(p for p in parts if p)
 
-    def _instance_from_constructor(self, node: ast.expr) -> Optional[Instance]:
+    @staticmethod
+    def _target_names(target: ast.expr) -> List[str]:
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [n for elt in target.elts for n in CallSiteVisitor._target_names(elt)]
+        if isinstance(target, ast.Starred):
+            return CallSiteVisitor._target_names(target.value)
+        return []
+
+    def _instance_from_constructor(self, node: Optional[ast.expr]) -> Optional[Instance]:
         """OpenAI(...) / openai.OpenAI(...) / azure.AzureOpenAI(...) -> ("openai", "<path>.Class")"""
         if not isinstance(node, ast.Call):
             return None
         func = node.func
-        if isinstance(func, ast.Name) and func.id in self.imports:
-            package, path = self.imports[func.id]
-            if path and path.split(".")[-1][:1].isupper():
-                return package, path
+        if isinstance(func, ast.Name):
+            imported = self._import(func.id)
+            if imported and imported[1] and imported[1].split(".")[-1][:1].isupper():
+                return imported
         elif isinstance(func, ast.Attribute):
             base, parts = _attribute_chain(func)
-            if isinstance(base, ast.Name) and base.id in self.imports and parts[-1][:1].isupper():
-                package, path = self.imports[base.id]
-                return package, self._join(path, *parts)
+            if isinstance(base, ast.Name) and parts[-1][:1].isupper():
+                imported = self._import(base.id)
+                if imported:
+                    package, path = imported
+                    return package, self._join(path, *parts)
         return None
 
-    def _record_assignment(self, target: ast.expr, instance: Instance):
-        if isinstance(target, ast.Name):
-            self.assignments[target.id] = instance
-            if self._depth == 0:
-                self.module_instances[target.id] = instance
-        elif (
-            isinstance(target, ast.Attribute)
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "self"
-        ):
-            self.self_assignments[target.attr] = instance
+    def _assign(self, targets: List[ast.expr], value: Optional[ast.expr]):
+        instance = self._instance_from_constructor(value) if value is not None else None
+        single = len(targets) == 1 and isinstance(targets[0], ast.Name)
+        for target in targets:
+            for name in self._target_names(target):
+                # Only `x = Ctor()` is tracked; tuple unpacking etc. just shadow
+                self._bind(name, ("instance", instance) if instance and single else OTHER)
 
     def visit_Assign(self, node: ast.Assign):
-        instance = self._instance_from_constructor(node.value)
-        if instance:
-            for target in node.targets:
-                self._record_assignment(target, instance)
-        self.generic_visit(node)
+        self.visit(node.value)
+        self._assign(node.targets, node.value)
+        for t in node.targets:
+            if not isinstance(t, ast.Name):
+                self.visit(t)
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
         if node.value is not None:
-            instance = self._instance_from_constructor(node.value)
-            if instance:
-                self._record_assignment(node.target, instance)
+            self.visit(node.value)
+            self._assign([node.target], node.value)
+        if not isinstance(node.target, ast.Name):
+            self.visit(node.target)
+
+    def visit_AugAssign(self, node: ast.AugAssign):
         self.generic_visit(node)
+        for name in self._target_names(node.target):
+            self._bind(name, OTHER)
+
+    def visit_NamedExpr(self, node):
+        self.visit(node.value)
+        self._assign([node.target], node.value)
+
+    def _visit_for(self, node):
+        self.visit(node.iter)
+        for name in self._target_names(node.target):
+            self._bind(name, OTHER)
+        for part in (node.body, node.orelse):
+            for stmt in part:
+                self.visit(stmt)
+
+    visit_For = _visit_for
+    visit_AsyncFor = _visit_for
+
+    def _visit_with(self, node):
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._assign([item.optional_vars], item.context_expr)
+        for stmt in node.body:
+            self.visit(stmt)
+
+    visit_With = _visit_with
+    visit_AsyncWith = _visit_with
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler):
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name:
+            self._bind(node.name, OTHER)
+        for stmt in node.body:
+            self.visit(stmt)
 
     # ---------- calls ----------
 
@@ -207,6 +423,7 @@ class CallSiteVisitor(ast.NodeVisitor):
                     positional_count=sum(1 for a in node.args if not isinstance(a, ast.Starred)),
                     has_star_args=any(isinstance(a, ast.Starred) for a in node.args),
                     kind=kind,
+                    statement_line=self._statement_line,
                 )
             )
         self.generic_visit(node)
@@ -219,11 +436,11 @@ class CallSiteVisitor(ast.NodeVisitor):
         """Returns (package, dotted path inside the package, kind) for calls into a package."""
         # fn(...) / Client(...) where `from pkg import fn, Client`
         if isinstance(func, ast.Name):
-            if func.id in self.imports:
-                package, path = self.imports[func.id]
-                if path:
-                    kind = "constructor" if self._is_class_name(path.split(".")[-1]) else "call"
-                    return package, path, kind
+            imported = self._import(func.id)
+            if imported and imported[1]:
+                package, path = imported
+                kind = "constructor" if self._is_class_name(path.split(".")[-1]) else "call"
+                return package, path, kind
             return None
 
         if not isinstance(func, ast.Attribute):
@@ -232,16 +449,17 @@ class CallSiteVisitor(ast.NodeVisitor):
         instance: Optional[Instance] = None
 
         if isinstance(base, ast.Name):
-            if base.id == "self" and parts and parts[0] in self.self_assignments:
+            self_name = self._self_names[-1]
+            if base.id == self_name and parts and self._self_attr(parts[0]):
                 # self.client.chat.completions.create(...)
-                instance = self.self_assignments[parts[0]]
+                instance = self._self_attr(parts[0])
                 parts = parts[1:]
-            elif base.id in self.assignments:
+            elif self._instance(base.id):
                 # client.chat.completions.create(...)
-                instance = self.assignments[base.id]
-            elif base.id in self.imports:
+                instance = self._instance(base.id)
+            elif self._import(base.id):
                 # openai.ChatCompletion.create(...) / t.fn(...) / mock_sdk.Client(...)
-                package, path = self.imports[base.id]
+                package, path = self._import(base.id)
                 kind = "constructor" if self._is_class_name(parts[-1]) else "call"
                 return package, self._join(path, *parts), kind
             else:

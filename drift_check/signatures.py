@@ -4,7 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from drift_check.models import SignatureDefinition
 
@@ -195,11 +195,24 @@ def instance_attr_type(cls, name):
     return found_anywhere, None
 
 
+def _is_api_member(value):
+    """Things on a class that are part of its API (as opposed to data defaults like `x = None`)."""
+    return (
+        inspect.isroutine(value)
+        or inspect.isclass(value)
+        or isinstance(value, (staticmethod, classmethod))
+        or is_lazy_property(value)
+        or inspect.ismodule(value)
+    )
+
+
 def traverse(package_name, method_name):
     """
-    Walk package.method_name. Returns (status, obj).
-    Attributes reached through an instance (property / self.x) are followed via
-    their type hints; when no hint exists the result is UNRESOLVED, never an ERROR.
+    Walk package.method_name. Returns (status, obj, drop_first).
+    drop_first is True when the final object is a plain function reached through a class,
+    so its first parameter is the implicit `self` and must not be counted.
+    Attributes reached through an instance (property / self.x / annotated field) are followed
+    via their type hints; when no hint exists the result is UNRESOLVED, never an ERROR.
     """
     full_call = f"{package_name}.{method_name}"
     try:
@@ -211,11 +224,13 @@ def traverse(package_name, method_name):
             obj = importlib.import_module(package_name)
             parts = method_name.split(".")
     except Exception as e:
-        return "IMPORT_FAILED", f"{type(e).__name__}: {e}"
+        return "IMPORT_FAILED", f"{type(e).__name__}: {e}", False
 
-    for i, part in enumerate(parts):
+    drop_first = False
+    for part in parts:
+        drop_first = False
         if obj.__class__.__name__ == "APIRemovedInV1Proxy":
-            return "METHOD_NOT_FOUND", None
+            return "METHOD_NOT_FOUND", None, False
         try:
             if inspect.isclass(obj):
                 # Look up without triggering descriptors so properties are visible.
@@ -224,7 +239,7 @@ def traverse(package_name, method_name):
                 nxt = getattr(obj, part, _MISSING)
         except Exception:
             # Custom SDK removal proxies raise on attribute access
-            return "METHOD_NOT_FOUND", None
+            return "METHOD_NOT_FOUND", None, False
 
         if nxt is _MISSING and inspect.ismodule(obj):
             # Submodules are only attributes once imported: pkg.sub.fn
@@ -233,36 +248,42 @@ def traverse(package_name, method_name):
                 nxt = importlib.import_module(submodule)
             except ModuleNotFoundError as e:
                 if e.name != submodule:
-                    return "IMPORT_FAILED", f"{type(e).__name__}: {e}"
+                    return "IMPORT_FAILED", f"{type(e).__name__}: {e}", False
                 nxt = _MISSING
             except Exception as e:
-                return "IMPORT_FAILED", f"{type(e).__name__}: {e}"
+                return "IMPORT_FAILED", f"{type(e).__name__}: {e}", False
+
+        if inspect.isclass(obj) and (nxt is _MISSING or not _is_api_member(nxt)):
+            # Instance data: `session: Session = None`, dataclass/pydantic fields, __slots__,
+            # or attributes only set in __init__. Follow the declared type instead of the default.
+            found, typ = instance_attr_type(obj, part)
+            if typ is not None:
+                obj = typ
+                continue
+            if found or nxt is not _MISSING:
+                return "UNRESOLVED", None, False
+            return "METHOD_NOT_FOUND", None, False
 
         if nxt is _MISSING:
-            if inspect.isclass(obj):
-                found, typ = instance_attr_type(obj, part)
-                if found:
-                    if typ is None:
-                        return "UNRESOLVED", None
-                    obj = typ
-                    continue
-            return "METHOD_NOT_FOUND", None
+            return "METHOD_NOT_FOUND", None, False
 
         if inspect.isclass(obj) and is_lazy_property(nxt):
             typ = return_type(property_getter(nxt))
             if typ is None:
-                return "UNRESOLVED", None
+                return "UNRESOLVED", None, False
             obj = typ
             continue
 
         if inspect.isclass(obj) and isinstance(nxt, (staticmethod, classmethod)):
-            nxt = getattr(obj, part)
+            nxt = getattr(obj, part)  # bound/unwrapped: no implicit first argument
+        elif inspect.isclass(obj) and inspect.isfunction(nxt):
+            drop_first = True          # plain method looked up on the class: first param is self
 
         obj = nxt
 
     if obj.__class__.__name__ == "APIRemovedInV1Proxy":
-        return "METHOD_NOT_FOUND", None
-    return "SUCCESS", obj
+        return "METHOD_NOT_FOUND", None, False
+    return "SUCCESS", obj, drop_first
 
 
 _DEPRECATION_HINTS = ("Deprecat", "FutureWarning")
@@ -313,9 +334,39 @@ def deprecation_of(obj):
     return None
 
 
+def unpacked_typeddict(annotation):
+    """For `**kwargs: Unpack[SomeTypedDict]`, return the TypedDict class, else None."""
+    origin = getattr(annotation, "__origin__", None)
+    unpack_forms = [getattr(typing, "Unpack", None)]
+    try:
+        import typing_extensions
+        unpack_forms.append(getattr(typing_extensions, "Unpack", None))
+    except ImportError:
+        pass
+    if origin is None or not any(origin is u for u in unpack_forms if u is not None):
+        return None
+    args = getattr(annotation, "__args__", None) or ()
+    if len(args) != 1:
+        return None
+    inner = args[0]
+    if isinstance(inner, type) and issubclass(inner, dict) and hasattr(inner, "__total__"):
+        return inner  # TypedDict from typing or typing_extensions
+    return None
+
+
+def model_field_names(obj):
+    """Field names of pydantic models, which may only expose aliases in their signature."""
+    if not inspect.isclass(obj):
+        return []
+    fields = getattr(obj, "model_fields", None)  # pydantic v2
+    if not isinstance(fields, dict):
+        fields = getattr(obj, "__fields__", None)  # pydantic v1
+    return list(fields) if isinstance(fields, dict) else []
+
+
 def main():
     package_name, method_name = sys.argv[1], sys.argv[2]
-    status, obj = traverse(package_name, method_name)
+    status, obj, drop_first = traverse(package_name, method_name)
     if status == "IMPORT_FAILED":
         emit(status, detail=obj)
         return
@@ -338,29 +389,31 @@ def main():
         return
 
     P = inspect.Parameter
-    params = [n for n in sig.parameters if n not in ("self", "cls")]
-    has_varkw = False
-    has_varargs = False
-    positional_names, required = [], []
-    for name, param in sig.parameters.items():
-        if name in ("self", "cls"):
-            continue
+    items = list(sig.parameters.items())
+    if drop_first and items and items[0][1].kind in (P.POSITIONAL_ONLY, P.POSITIONAL_OR_KEYWORD):
+        items = items[1:]  # implicit `self` of a method looked up on its class
+
+    params, positional_names, required = [], [], []
+    has_varkw = has_varargs = False
+    for name, param in items:
         if param.kind == P.VAR_POSITIONAL:
             has_varargs = True
         elif param.kind == P.VAR_KEYWORD:
-            has_varkw = True
-            ann = param.annotation
-            if ann is not P.empty:
-                type_args = getattr(ann, "__args__", None)
-                target_type = type_args[0] if type_args else ann
-                if hasattr(target_type, "__annotations__"):
-                    params.extend(target_type.__annotations__.keys())
-                    has_varkw = False
+            typed = unpacked_typeddict(param.annotation) if param.annotation is not P.empty else None
+            if typed is not None:
+                # **kwargs: Unpack[Options] -> exactly the TypedDict's keys
+                params.extend(getattr(typed, "__annotations__", {}).keys())
+            else:
+                has_varkw = True
         else:
+            if param.kind != P.POSITIONAL_ONLY:
+                params.append(name)
             if param.kind in (P.POSITIONAL_ONLY, P.POSITIONAL_OR_KEYWORD):
                 positional_names.append(name)
             if param.default is P.empty:
                 required.append(name)
+
+    params.extend(model_field_names(obj))
 
     emit(
         "SUCCESS",
@@ -368,7 +421,7 @@ def main():
         accepts_kwargs=has_varkw,
         positional_names=positional_names,
         max_positional=None if has_varargs else len(positional_names),
-        required_params=required,
+        required_params=[r for r in required if r in positional_names or r in params],
         deprecated=deprecated,
     )
 
@@ -415,7 +468,8 @@ class StubProvider:
         "print(s.origin if s and s.origin else '')"
     )
 
-    def resolve(self, python_exec: str, package_name: str, method_name: str) -> Optional[List[str]]:
+    def resolve(self, python_exec: str, package_name: str, method_name: str) -> Optional[Tuple[List[str], bool]]:
+        """(parameter names, accepts **kwargs) from the package's .pyi/.py source, or None."""
         try:
             out = subprocess.run(
                 [python_exec, "-c", self._FIND_ORIGIN, package_name],
@@ -441,11 +495,24 @@ class StubProvider:
             )
             if scope is None:
                 return None
+        # All definitions with this name: @overload variants plus the implementation
+        params: List[str] = []
+        accepts_kwargs = False
+        found = False
+        in_class = scope is not tree
         for node in getattr(scope, "body", []):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == parts[-1]:
-                args = [a.arg for a in node.args.args + node.args.kwonlyargs if a.arg not in ("self", "cls")]
-                return args
-        return None
+                found = True
+                positional = getattr(node.args, "posonlyargs", []) + node.args.args
+                is_static = any(getattr(d, "id", None) == "staticmethod" for d in node.decorator_list)
+                if in_class and not is_static and positional:
+                    positional = positional[1:]  # implicit self / cls
+                params.extend(a.arg for a in node.args.args + node.args.kwonlyargs if a in positional
+                              or a in node.args.kwonlyargs)
+                accepts_kwargs = accepts_kwargs or node.args.kwarg is not None
+        if not found:
+            return None
+        return sorted(set(params)), accepts_kwargs
 
 
 def find_uv() -> Optional[str]:
@@ -563,10 +630,12 @@ class SignatureResolver:
         # Static stubs can only help when the object exists but couldn't be inspected.
         # Never use them to overrule a definite METHOD_NOT_FOUND from the target sandbox.
         if status not in _NO_STUB_FALLBACK:
-            params = self.stub_provider.resolve(python_exec, package_name, method_name)
-            if params is not None:
+            stub = self.stub_provider.resolve(python_exec, package_name, method_name)
+            if stub is not None:
+                params, accepts_kwargs = stub
                 return SignatureDefinition(package_name, method_name, params, is_unknown=False,
-                                           error_code="SUCCESS", deprecated=data.get("deprecated"))
+                                           accepts_kwargs=accepts_kwargs, error_code="SUCCESS",
+                                           deprecated=data.get("deprecated"))
 
         return SignatureDefinition(package_name, method_name, [], is_unknown=True, error_code=status,
                                    deprecated=data.get("deprecated"))

@@ -154,7 +154,8 @@ def uncovered_call_sites(call_sites: Iterable[CallSite], executed: Dict[str, Set
         if call.kind == "import":
             continue
         lines = executed.get(os.path.realpath(call.file_path))
-        if lines is None or call.line_number not in lines:
+        # Coverage reports a multi-line statement by its first line only
+        if lines is None or (call.line_number not in lines and call.statement_line not in lines):
             result.append(call)
     return result
 

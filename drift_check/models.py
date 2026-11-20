@@ -26,6 +26,10 @@ class CallSite:
     # Positional arguments at the call site, and whether one of them is *args
     positional_count: int = 0
     has_star_args: bool = False
+    # Import inside `try: ... except ImportError:` (an optional dependency or version fallback)
+    guarded: bool = False
+    # First line of the enclosing statement (coverage reports statements by their first line)
+    statement_line: int = 0
 
 
 @dataclass

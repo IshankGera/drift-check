@@ -120,6 +120,16 @@ def build_cases(call_sites: List[CallSite], model_override: Optional[str] = None
     return list(cases.values()), unprobeable
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: urllib would resend the Authorization header to the new host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def send_probe(base_url: str, api_key: str, case: ProbeCase, timeout: float = 60.0) -> ProbeResult:
     body = {"model": case.model, "messages": PING_MESSAGES, **case.params}
     request = urllib.request.Request(
@@ -133,10 +143,15 @@ def send_probe(base_url: str, api_key: str, case: ProbeCase, timeout: float = 60
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
+        with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as resp:
             resp.read()
             return ProbeResult("OK", resp.status)
     except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            location = e.headers.get("Location", "another URL") if e.headers else "another URL"
+            return ProbeResult("INCONCLUSIVE", e.code,
+                               f"Server redirected to {location}. Not followed, because that would resend "
+                               f"your API key. Pass the final URL with --base-url.")
         return classify_error(e.code, e.read().decode("utf-8", errors="replace"))
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
         reason = getattr(e, "reason", e)
@@ -145,14 +160,21 @@ def send_probe(base_url: str, api_key: str, case: ProbeCase, timeout: float = 60
 
 def classify_error(http_status: int, raw_body: str) -> ProbeResult:
     try:
-        err = json.loads(raw_body).get("error", {})
-        if isinstance(err, str):
-            err = {"message": err}
+        payload = json.loads(raw_body)
+        err = payload.get("error") if isinstance(payload, dict) else None
     except Exception:
-        err = {"message": raw_body[:300]}
+        err = None
+    if isinstance(err, str):
+        err = {"message": err}
+    if not isinstance(err, dict):
+        # {"error": null}, a list, plain text, an HTML error page...
+        err = {"message": raw_body.strip()[:300]}
 
-    message = (err.get("message") or "").strip() or f"HTTP {http_status}"
-    param, code = err.get("param"), err.get("code")
+    raw_message = err.get("message")
+    message = (raw_message if isinstance(raw_message, str) else json.dumps(raw_message) if raw_message else "")
+    message = message.strip() or f"HTTP {http_status}"
+    param = err.get("param") if isinstance(err.get("param"), str) else None
+    code = err.get("code") if isinstance(err.get("code"), str) else None
 
     if http_status in (401, 403):
         return ProbeResult("AUTH_ERROR", http_status, message, param, code)

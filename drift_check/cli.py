@@ -1,4 +1,5 @@
 import os
+import sys
 import shlex
 import tempfile
 from pathlib import Path
@@ -199,7 +200,7 @@ def upgrade(
         sig = sig_resolver.resolve(call.package_name, call.method_name)
         baseline = None
         # Compare with the installed version only when the target shows a problem
-        if call.kind != "import" and (RuleEngine.argument_issues(call, sig) or sig.deprecated):
+        if RuleEngine.needs_baseline(call, sig):
             baseline = sig_resolver.resolve_baseline(call.package_name, call.method_name)
         all_findings.extend(rule_engine.evaluate(call, sig, baseline))
     all_findings = suppress_consequences(all_findings)
@@ -437,5 +438,34 @@ def test_command(
         raise typer.Exit(code=EXIT_BREAKING)
 
 
+def _configure_streams():
+    """
+    Windows consoles and CI logs are often not UTF-8 (cp1252). Printing ✓/❌ there would
+    crash, so unsupported characters are replaced instead.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+def run():
+    """Console entry point: like app(), but an unexpected crash exits 2 (tool error), never 1."""
+    _configure_streams()
+    try:
+        app()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print("\ndrift-check crashed (this is a bug in drift-check, not in your code). "
+              "Please report it at https://github.com/IshankGera/drift-check/issues", file=sys.stderr)
+        sys.exit(EXIT_TOOL_ERROR)
+
+
 if __name__ == "__main__":
-    app()
+    run()

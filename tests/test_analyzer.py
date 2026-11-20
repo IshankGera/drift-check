@@ -148,3 +148,110 @@ def test_constructors_and_argument_counts(tmp_path):
     """})
     shape = sorted((c.method_name, c.kind, c.positional_count, c.has_star_args) for c in calls if c.kind != "import")
     assert shape == [("Client", "constructor", 1, False), ("Other", "constructor", 0, False), ("fn", "call", 2, True)]
+
+
+# ---------- v0.4.1: scope-aware tracking (independent review, bug 2) ----------
+
+def test_same_variable_name_in_different_functions(tmp_path):
+    calls = analyze(tmp_path, {"a.py": """
+        from sdk import Client
+
+        def a():
+            client = Client()
+            client.send()
+
+        def b():
+            client = MyOwnClient()
+            client.my_method()
+    """})
+    assert methods(calls) == [("a.py", "Client.send")]
+
+
+def test_self_attributes_are_per_class(tmp_path):
+    calls = analyze(tmp_path, {"a.py": """
+        from sdk import Client
+
+        class A:
+            def __init__(self):
+                self.conn = Client()
+            def go(self):
+                self.conn.send()
+
+        class B:
+            def __init__(self):
+                self.conn = make_db()
+            def go(self):
+                self.conn.execute()
+    """})
+    assert methods(calls) == [("a.py", "Client.send")]
+
+
+def test_parameter_shadows_import(tmp_path):
+    calls = analyze(tmp_path, {"a.py": """
+        import sdk
+
+        def handler(sdk):
+            sdk.whatever()
+
+        sdk.real_call()
+    """})
+    assert methods(calls) == [("a.py", "real_call")]
+
+
+def test_reassignment_stops_tracking(tmp_path):
+    calls = analyze(tmp_path, {"a.py": """
+        from sdk import Client
+        c = Client()
+        c.send()
+        c = something_else()
+        c.other()
+    """})
+    assert methods(calls) == [("a.py", "Client.send")]
+
+
+def test_comprehension_and_loop_variables_shadow(tmp_path):
+    calls = analyze(tmp_path, {"a.py": """
+        from sdk import Client
+        client = Client()
+        names = [client.name() for client in other_clients]
+        for client in other_clients:
+            client.close()
+    """})
+    assert methods(calls) == []
+
+
+def test_module_level_client_used_in_function_and_exported(tmp_path):
+    calls = analyze(tmp_path, {
+        "svc.py": "from sdk import Client\nclient = Client()\ndef f():\n    client.send()\n",
+        "use.py": "from svc import client\nclient.send()\n",
+    })
+    assert methods(calls) == [("svc.py", "Client.send"), ("use.py", "Client.send")]
+
+
+def test_class_body_names_not_visible_in_methods(tmp_path):
+    calls = analyze(tmp_path, {"a.py": """
+        from sdk import Client
+        class A:
+            client = Client()
+            def go(self):
+                client.send()
+    """})
+    assert methods(calls) == []
+
+
+def test_guarded_imports_are_marked(tmp_path):
+    calls = analyze(tmp_path, {"a.py": """
+        try:
+            from sdk import NewThing
+        except ImportError:
+            from sdk import OldThing as NewThing
+        from sdk import Always
+    """})
+    guarded = {c.method_name: c.guarded for c in calls if c.kind == "import"}
+    assert guarded == {"NewThing": True, "OldThing": False, "Always": False}
+
+
+def test_statement_line_for_multiline_calls(tmp_path):
+    calls = analyze(tmp_path, {"a.py": "import sdk\nx = dict(\n    a=sdk.dumps(\n        {}),\n)\n"})
+    [call] = [c for c in calls if c.kind == "call"]
+    assert (call.line_number, call.statement_line) == (3, 2)

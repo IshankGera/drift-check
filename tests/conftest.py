@@ -140,7 +140,7 @@ FAKE_SDK = {
 @pytest.fixture(scope="session")
 def sdk_dir(tmp_path_factory):
     root = tmp_path_factory.mktemp("sdk")
-    for rel, src in FAKE_SDK.items():
+    for rel, src in {**FAKE_SDK, **REVIEW_SDK}.items():
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(textwrap.dedent(src))
@@ -157,3 +157,57 @@ def worker(sdk_dir):
         assert out.returncode == 0, out.stderr
         return json.loads(out.stdout.strip().splitlines()[-1])
     return run
+
+
+# ---------- v0.4.1 regression fixtures (from the independent review) ----------
+REVIEW_SDK = {
+    "reviewsdk/__init__.py": """
+        from dataclasses import dataclass
+        from typing import Any, Optional, TypedDict
+        try:
+            from typing import Unpack
+        except ImportError:
+            from typing_extensions import Unpack
+
+        class Session:
+            def get(self, url, *, timeout=None):
+                pass
+
+        class Options(TypedDict, total=False):
+            temperature: float
+            top_p: float
+
+        def anykw(model, **kwargs: Any):
+            pass
+
+        def typed_kw(model, **kwargs: Unpack[Options]):
+            pass
+
+        def dumps(obj, *, cls=None):
+            pass
+
+        class Client:
+            session: Optional[Session] = None
+
+            def send(self, payload, retries=3):
+                pass
+
+            @classmethod
+            def build(cls, region):
+                pass
+
+            @staticmethod
+            def helper(x):
+                pass
+
+        @dataclass
+        class Cfg:
+            session: Optional[Session] = None
+
+        class Slotted:
+            __slots__ = ("session",)
+
+            def __init__(self):
+                self.session = Session()
+    """,
+}
