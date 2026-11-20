@@ -1,0 +1,72 @@
+name: "drift-check"
+description: "Check your Python code against new dependency versions before you upgrade."
+author: "Ishank Gera"
+branding:
+  icon: "shield"
+  color: "blue"
+
+inputs:
+  updates:
+    description: >
+      Packages to check, one "name==version" per line (for example the versions a
+      Dependabot or Renovate pull request upgrades to).
+    required: true
+  working-directory:
+    description: "Project folder to scan."
+    required: false
+    default: "."
+  drift-check-version:
+    description: "py-drift-check version to install (empty = latest)."
+    required: false
+    default: ""
+
+outputs:
+  exit-code:
+    description: "0 = safe, 1 = breaking changes found, 2 = setup error."
+    value: ${{ steps.run.outputs.exit-code }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install drift-check into the project's Python
+      shell: bash
+      env:
+        DC_VERSION: ${{ inputs.drift-check-version }}
+      run: |
+        # Installed next to the project's dependencies so the baseline version is visible.
+        if [ -n "$DC_VERSION" ]; then
+          python -m pip install --quiet "py-drift-check==$DC_VERSION"
+        else
+          python -m pip install --quiet py-drift-check
+        fi
+
+    - name: Check each upgrade
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        DC_UPDATES: ${{ inputs.updates }}
+      run: |
+        overall=0
+        while IFS= read -r line || [ -n "$line" ]; do
+          line="$(echo "$line" | tr -d '[:space:]')"
+          [ -z "$line" ] && continue
+          case "$line" in
+            *==*) ;;
+            *) echo "::error title=drift-check::'$line' must look like name==version"
+               [ "$overall" -eq 0 ] && overall=2
+               continue ;;
+          esac
+          pkg="${line%%==*}"
+          ver="${line#*==}"
+          echo "::group::drift-check upgrade $pkg --to $ver"
+          rc=0
+          drift-check upgrade "$pkg" --to "$ver" --json-report "drift-check-$pkg.json" || rc=$?
+          echo "::endgroup::"
+          # Breaking changes (1) outrank setup errors (2) in the final result
+          if [ "$rc" -eq 1 ]; then overall=1
+          elif [ "$rc" -ne 0 ] && [ "$overall" -eq 0 ]; then overall=$rc
+          fi
+        done <<< "$DC_UPDATES"
+        echo "exit-code=$overall" >> "$GITHUB_OUTPUT"
+        exit $overall

@@ -1,0 +1,47 @@
+# Copy to .github/workflows/drift-check.yml in your project.
+# On every Dependabot pull request, checks your code against the NEW versions,
+# using the OLD versions as the baseline, and fails the PR if a call you make breaks.
+name: drift-check
+
+on: pull_request
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  drift-check:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read which versions Dependabot is upgrading to
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+
+      - name: Check out the code BEFORE the upgrade (old versions = baseline)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the current dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: List the upgrades as name==version
+        id: updates
+        env:
+          DEPS: ${{ steps.meta.outputs.updated-dependencies-json }}
+        run: |
+          {
+            echo "list<<EOF"
+            echo "$DEPS" | jq -r '.[] | "\(.dependencyName)==\(.newVersion)"'
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: drift-check
+        uses: IshankGera/drift-check@v0.4.0
+        with:
+          updates: ${{ steps.updates.outputs.list }}

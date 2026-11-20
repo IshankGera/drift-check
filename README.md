@@ -1,138 +1,114 @@
 # drift-check 🔎
 
-**Stop guessing if a dependency upgrade, or an LLM provider's server, will break your Python code.**
+**Know which lines of your Python code a dependency upgrade will break, before you upgrade.**
 
-Upgrading Python packages in a large or legacy codebase often feels like a gamble. Will moving a dependency to a new major version break everything? `drift-check` is an experimental CLI tool that analyzes your code against a **future** dependency version *before* you actually upgrade.
+Changelogs list every change in a release. Linters and type checkers only see the versions you already have installed. `drift-check` answers one question: *"If I upgrade this package right now, what in **my** code breaks?"*
 
-Instead of generic linting, `drift-check` spins up an isolated sandbox, extracts the new API signatures, and reports exactly which lines of your codebase will break if you apply the upgrade.
-
-## 🚀 How It Works
-
-1. **Baseline Verification:** Parses your `requirements.txt` and active `.venv` to confirm the installed version matches what you declared.
-2. **PyPI Resolution:** Validates and normalizes your target version (e.g., resolving `15` to `15.0.0` automatically).
-3. **Targeted Sandboxing:** Uses `uv` (installed automatically as a dependency) to silently spin up a temporary virtual environment containing the future target package.
-4. **AST Intersection Analysis:** Reads your Python files without executing them, identifying only the API calls your code actually makes, and cross-references them against the target sandbox.
-5. **CI/CD Ready:** Exits with code `1` if breaking changes are found, blocking bad dependency updates from merging.
-
-### Exit codes
-
-| Code | Meaning |
-|---|---|
-| `0` | No breaking changes (warnings may be present) |
-| `1` | Breaking changes found: a used method or parameter no longer exists |
-| `2` | Setup error: package not declared/installed, version not found, invalid wheel, or sandbox build failed |
+It builds a throwaway sandbox with the new version, compares it with the code you actually use, and reports only what affects you. New features and changes to things you never call are ignored.
 
 ## 📦 Installation
 
-Install globally via `uv` (recommended):
 ```bash
-uv tool install py-drift-check
-
+uv tool install py-drift-check    # recommended
+pip install py-drift-check        # or with pip
 ```
 
-Or via pip:
+`uv` is installed automatically and is used to build the sandboxes.
 
-```bash
-pip install py-drift-check
+## 🧭 Four checks, from fastest to deepest
 
-```
+| Command | What it checks | Needs |
+|---|---|---|
+| `drift-check upgrade` | Your calls against the new version's API: removed methods and imports, removed/renamed keyword arguments, new required arguments, positional-argument changes, deprecations | Nothing extra. Fast, never runs your code |
+| `drift-check typecheck` | Runs a type checker before and after the upgrade and reports **only new** type errors. Catches cases the call check cannot see, such as methods on your own subclasses of the package's classes | Your project's dependencies (copied into a sandbox) |
+| `drift-check test` | Runs your tests with the new version and compares with today: newly failing tests, new deprecation warnings, and calls into the package that **no test runs** | `pytest` tests |
+| `drift-check probe` | Optional add-on for LLM apps: checks `chat.completions.create()` calls against the provider's server, or against built-in rules with `--offline` | An API key, except with `--offline` |
+
+All commands share the same exit codes, so they drop straight into CI:
+
+| Code | Meaning |
+|---|---|
+| `0` | Safe (warnings may be present) |
+| `1` | Breaking changes found |
+| `2` | Setup error: package not declared/installed, version not found, invalid wheel, or sandbox build failed |
 
 ## 💻 Quickstart
 
-Navigate to your Python project directory and run the `upgrade` command:
+Run from your project folder, with its virtual environment present (`.venv`, `venv`, `env`, or an activated one):
 
 ```bash
-# Check if upgrading 'openai' to v1.52.0 will break your current code
-drift-check upgrade openai --to 1.52.0
-
+drift-check upgrade openai --to 2.0.0
+drift-check typecheck pydantic --to 2.9.2
+drift-check test openai --to 2.0.0 --pytest-args "tests/unit"
+drift-check probe --offline
 ```
 
-### Testing Internal or Unpublished Packages
-
-If you are developing an internal SDK or a private package, you can bypass PyPI entirely and analyze your code against a local `.whl` file:
+Test against an internal or unpublished package with a local wheel:
 
 ```bash
-drift-check upgrade mock-sdk --to 2.0.0 --local-wheel ./dist/mock_sdk-2.0.0-py3-none-any.whl
-
+drift-check upgrade my-sdk --to 2.0.0 --local-wheel ./dist/my_sdk-2.0.0-py3-none-any.whl
 ```
 
-## 🌐 Server Probe for OpenAI-compatible APIs
+The baseline (your current version) is read from `requirements.txt`, `pyproject.toml` (`[project]` dependencies, optional dependencies and `[dependency-groups]`), or `uv.lock`, and must match what is installed.
 
-The Python SDK can accept a parameter that the **server** rejects at runtime. For example, OpenAI's reasoning models reject `max_tokens` and ask for `max_completion_tokens`, while the SDK still accepts both. `drift-check upgrade` cannot see this, so there is a separate, opt-in command:
+## 🔬 `upgrade`: how it works
+
+1. **Baseline check:** confirms the installed version matches your declared dependency.
+2. **AST scan:** reads your code without running it and records every call into the package: module functions, `from pkg import fn` imports, aliased and deep imports, constructors, and client objects (`client = OpenAI()`, `self.client`, clients imported from another module, and chained calls).
+3. **Sandbox:** installs the target version into a temporary virtual environment with `uv`.
+4. **Signature check:** inspects the real signatures in the sandbox, following type hints through chains like `client.chat.completions.create`, including lazily imported types.
+5. **Compare with today:** argument problems are reported only if your current version accepts the call and the new one does not, so nothing that is already broken (or misread) shows up as noise.
+
+```text
+│ ❌ ERROR │ app.py:1 │ mock_sdk │ Import 'old_method' from 'mock_sdk' no longer exists in the target version.
+│ ❌ ERROR │ app.py:4 │ mock_sdk │ Required parameter 'region' is not passed (it is required in the target version).
+│ ⚠ WARN   │ app.py:7 │ pydantic │ Deprecated in the target version: `parse_obj_as` is deprecated. Use
+│          │          │          │ `pydantic.TypeAdapter.validate_python` instead.
+```
+
+## 🤖 CI: GitHub Action
+
+`action.yml` in this repository is a ready-made GitHub Action. It checks one or more `name==version` upgrades, fails the job on breaking changes, and shows findings as inline annotations on the pull request.
+
+```yaml
+- uses: IshankGera/drift-check@v0.4.0
+  with:
+    updates: |
+      openai==2.0.0
+      pydantic==2.9.2
+```
+
+[`examples/dependabot-drift-check.yml`](examples/dependabot-drift-check.yml) is a complete workflow for Dependabot pull requests. It installs the **old** versions as the baseline and checks your code against the **new** ones.
+
+Every command also accepts `--json-report report.json`. Inside GitHub Actions, findings are printed as `::error` / `::warning` annotations automatically.
+
+## 🌐 `probe`: server-side checks for LLM apps (optional)
+
+The Python SDK can accept a parameter that the **server** rejects at runtime. For example, OpenAI's reasoning models reject `max_tokens` and ask for `max_completion_tokens`, while the SDK still accepts both. No static check can see this, so `probe` offers two modes:
 
 ```bash
+drift-check probe --offline                         # built-in rules, no key, nothing sent
+drift-check probe --offline --rules my_rules.json   # add your own rules
+drift-check probe --dry-run                         # show what a live probe would send
 export OPENAI_API_KEY=sk-...
-drift-check probe                                   # uses model="..." literals from your code
-drift-check probe --model o3-mini                   # when the model comes from config/env
+drift-check probe                                   # live: one tiny request per unique model + parameters
 drift-check probe --base-url https://api.groq.com/openai/v1 --api-key-env GROQ_API_KEY
-drift-check probe --dry-run                         # show what would be sent, send nothing
 ```
 
-How it works:
+**Live mode:** requests go directly from your machine or CI runner to the provider, with your own key. Nothing is sent unless you run `probe` without `--offline` or `--dry-run`. The key is never printed. `--max-requests` (default 20) caps the number of requests. In CI, a project-scoped key with a small spending limit is recommended.
 
-1. Finds every `chat.completions.create(...)` call (including `self.client...`, clients imported from other modules, and chained calls).
-2. Groups them by model and parameters, and sends **one tiny request per unique combination** ("Reply with the single word: ok"), using your values where they are literals in the code and safe placeholders otherwise.
-3. Turns server rejections into findings. If a server rejects one parameter, the probe drops it and retries, so one run lists every incompatible parameter.
+**Probe limits:** chat completions only, OpenAI-style `Bearer` auth (Azure OpenAI is not supported yet), and one base URL per run. Offline rules only know what is in the rules file.
 
-```text
-│ ❌ ERROR │ llm.py:7 │ openai │ Model 'o3-mini': Server (400): Unsupported parameter: 'max_tokens'
-│          │          │        │ is not supported with this model. Use 'max_completion_tokens' instead.
-```
+## ⚠️ Known limitations
 
-**Privacy and cost:** requests go directly from your machine or CI runner to the provider, with your own key. Nothing is sent anywhere else, and nothing is sent unless you run `probe`. Each request is a few tokens, billed to your provider account. The key is never printed. `--max-requests` (default 20) caps the number of requests.
+This tool is an alpha.
 
-**Probe limits:** chat completions only, OpenAI-style `Bearer` auth (Azure OpenAI is not supported yet), and one base URL per run. Parameters whose value is neither a literal nor in the placeholder list (e.g. `tools`) are reported as "not probed".
-
-## 📊 Example Output
-
-`drift-check` intentionally ignores new features in the target version to filter out noise, strictly reporting **actionable breaking changes**:
-
-```text
-Starting Upgrade Analysis for openai -> 1.52.0...
-Verifying environment baseline...
-✓ Baseline established: openai == 1.45.0
-
-Resolving target version '1.52.0' on PyPI...
-✓ Target resolved: 1.52.0
-
-Building isolated sandbox for openai==1.52.0...
-Scanning codebase for API calls...
-
-Drift Check Results:
-┏━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ Status     ┃ Location      ┃ Package  ┃ Message                                                 ┃
-┡━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-│ ❌ ERROR   │ service.py:42 │ openai   │ Parameter 'max_tokens' is no longer supported.          │
-│ ❌ ERROR   │ test_api.py:8 │ openai   │ Method 'old_method' no longer exists in target version. │
-│ ⚠ WARN     │ router.py:12  │ openai   │ Target API uses dynamic **kwargs. (Confidence: LOW)     │
-└────────────┴───────────────┴──────────┴─────────────────────────────────────────────────────────┘
-
-Build Failed: Incompatible API calls detected in target version.
-
-```
-
-## ⚠️ Features & Current Limitations
-
-This tool is in active development.
-
-**Supported Features:**
-
-* Strict environment baseline enforcement.
-* PyPI fallback resolution prompts (in CI or any non-interactive shell, it fails with exit code `2` and suggests the closest release instead of prompting).
-* Unpacking modern `TypedDict` and `Unpack` type-hints for strict kwargs evaluation.
-* Seamless `uv` sandbox management.
-* Local `.whl` file bypass support (the wheel's name and version are validated against `--to`).
-* Client-object SDKs (e.g. `client = OpenAI(); client.chat.completions.create(...)`) are resolved by following property and attribute type hints. When a hop has no type hint, the call is reported as a low-confidence warning instead of an error.
-
-**Known Limitations:**
-
-* **Dependency Files:** Currently only supports reading baselines from `requirements.txt` (support for `pyproject.toml` and `uv.lock` is planned).
-* **Variable Inference:** Clients are traced when created in the same file, stored on `self`, imported from another module (`from app.llm import client`), or chained (`OpenAI().chat...`). Clients passed in as function arguments or returned from functions are not traced yet.
-* **Dynamic Kwargs:** Cannot statically verify dynamic arguments passed at the call site (e.g., `client.create(**my_dict)`).
-* **Positional and required arguments:** Only keyword arguments you pass are checked. A positional argument count change, or a parameter that became required, is not detected yet.
-* **Import names:** The package name must match its import name (e.g. `openai`, `stripe`). Packages like `pyyaml` → `yaml` are not mapped yet.
+* **Dynamic code:** calls built with `getattr`, dictionaries passed as `**kwargs`, or `*args` cannot be checked statically (`typecheck` and `test` help here).
+* **Objects passed around:** clients passed in as function arguments or returned from functions are not traced by `upgrade` (`typecheck` covers them).
+* **Behaviour changes:** a function that keeps its signature but behaves differently is only caught by `test`.
+* **Deprecations:** detected from `@deprecated` markers and unconditional `warnings.warn(..., DeprecationWarning)` calls. Warnings raised only for some arguments are not reported by `upgrade` (they show up in `test`).
+* **Import names:** the package name must match its import name (e.g. `openai`, `stripe`). Packages like `pyyaml` → `yaml` are not mapped yet.
 
 ## License
 
 MIT
-
