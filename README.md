@@ -1,5 +1,10 @@
 # drift-check 🔎
 
+[![PyPI version](https://img.shields.io/pypi/v/py-drift-check)](https://pypi.org/project/py-drift-check/)
+[![Monthly downloads](https://img.shields.io/pypi/dm/py-drift-check)](https://pypistats.org/packages/py-drift-check)
+[![Total downloads](https://static.pepy.tech/badge/py-drift-check)](https://pepy.tech/projects/py-drift-check)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 **Know which lines of your Python code a dependency upgrade will break, before you upgrade.**
 
 Changelogs list every change in a release. Linters and type checkers only see the versions you already have installed. `drift-check` answers one question: *"If I upgrade this package right now, what in **my** code breaks?"*
