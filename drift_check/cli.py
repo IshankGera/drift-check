@@ -3,20 +3,22 @@ import sys
 import shlex
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import urlparse
 
 import typer
 from rich.console import Console
+from rich.markup import escape
+from rich.table import Table
 from packaging.utils import canonicalize_name, parse_wheel_filename, InvalidWheelFilename
 from packaging.version import Version, InvalidVersion
 from drift_check.env import EnvironmentDetector
 from drift_check.dependencies import BaselineResolver, BaselineStatus , DependencyDeclarationResolver
-from drift_check.pypi import PyPIResolver
+from drift_check.pypi import PyPIResolver, latest_release
 from drift_check.scanner import ProjectScanner
 from drift_check.analyzer import ASTAnalyzer
 from drift_check.signatures import SignatureResolver, SandboxError
-from drift_check import probe as probe_mod
+from drift_check import importnames, probe as probe_mod
 from drift_check import testrun, typecheck as typecheck_mod
 from drift_check.fullenv import ProjectSandbox, project_pythonpath
 from drift_check.rules import RuleEngine, suppress_consequences
@@ -115,6 +117,41 @@ def resolve_target(package: str, to_version: str, local_wheel: Optional[str]) ->
     return resolved
 
 
+def import_fallback(package: str) -> str:
+    return importnames.fallback_name(package)
+
+
+def collect_call_sites(package: str, project_python: str):
+    """(import names of the package, calls/imports into it found in this project)."""
+    modules = importnames.import_names(project_python, package)
+    py_files, _ = ProjectScanner(".").scan()
+    wanted = set(modules)
+    calls = [c for c in ASTAnalyzer(py_files, root=Path(".")).analyze() if c.package_name in wanted]
+    return modules, calls
+
+
+def check_calls(package: str, version: str, local_wheel: Optional[str], project_python: str,
+                call_sites, verbose: bool = False):
+    """Builds the target sandbox and evaluates every call site. Raises SandboxError."""
+    sig_resolver = SignatureResolver(
+        project_python_exec=project_python,
+        target_version=version,
+        package_to_sandbox=package,
+        local_wheel=local_wheel,
+        verbose=verbose,
+    )
+    rule_engine = RuleEngine()
+    findings = []
+    for call in call_sites:
+        sig = sig_resolver.resolve(call.package_name, call.method_name)
+        baseline = None
+        # Compare with the installed version only when the target shows a problem
+        if RuleEngine.needs_baseline(call, sig):
+            baseline = sig_resolver.resolve_baseline(call.package_name, call.method_name)
+        findings.extend(rule_engine.evaluate(call, sig, baseline))
+    return suppress_consequences(findings)
+
+
 @app.callback()
 def main(
     version: bool = typer.Option(
@@ -150,6 +187,9 @@ def upgrade(
     json_report: str = typer.Option(
         None, "--json-report", help="Also write the findings to this JSON file (for CI)."
     ),
+    sarif: str = typer.Option(
+        None, "--sarif", help="Also write a SARIF file, for GitHub code scanning."
+    ),
 ):
     """
     Check your code against a future version of a package, before you upgrade.
@@ -160,59 +200,142 @@ def upgrade(
     
     project_python = establish_baseline(package)
 
-    # 3. AST Scanning (before any network/sandbox work)
     console.print("[dim]Scanning codebase for API calls...[/dim]")
-    scanner = ProjectScanner(".")
-    py_files, _ = scanner.scan()
-    normalized_target_pkg = normalize_name(package)
-    call_sites = [
-        call for call in ASTAnalyzer(py_files, root=Path(".")).analyze()
-        if normalize_name(call.package_name) == normalized_target_pkg
-    ]
+    modules, call_sites = collect_call_sites(package, project_python)
+    public = [m for m in modules if not m.startswith("_")]
+    if public and public != [import_fallback(package)]:
+        console.print(f"[dim]'{package}' is imported as: {', '.join(public)}[/dim]")
 
     if not call_sites:
         console.print(f"[green]✓ No calls to '{package}' found in this project. Nothing to check.[/green]")
-        if json_report:
-            Reporter().generate_json_report([], json_report)
+        Reporter().report([], json_path=json_report, sarif_path=sarif, quiet=True)
         return
 
     resolved_target = resolve_target(package, to_version, local_wheel)
 
-    # 5. Target API Resolution & Sandboxing
     console.print(f"\n[dim]Building isolated sandbox for {package}=={resolved_target}...[/dim]")
+    n_imports = sum(1 for c in call_sites if c.kind == "import")
+    console.print(f"[dim]Checking {len(call_sites) - n_imports} call(s) and {n_imports} import(s)...[/dim]")
     try:
-        sig_resolver = SignatureResolver(
-            project_python_exec=project_python,
-            target_version=resolved_target,
-            package_to_sandbox=package,
-            local_wheel=local_wheel,
-            verbose=verbose,
-        )
+        all_findings = check_calls(package, resolved_target, local_wheel, project_python, call_sites, verbose)
     except SandboxError as e:
         console.print(f"[bold red]❌ Error:[/bold red] {e}")
         raise typer.Exit(code=EXIT_TOOL_ERROR)
 
-    n_imports = sum(1 for c in call_sites if c.kind == "import")
-    console.print(f"[dim]Checking {len(call_sites) - n_imports} call(s) and {n_imports} import(s)...[/dim]")
-    rule_engine = RuleEngine()
-    all_findings = []
-    for call in call_sites:
-        sig = sig_resolver.resolve(call.package_name, call.method_name)
-        baseline = None
-        # Compare with the installed version only when the target shows a problem
-        if RuleEngine.needs_baseline(call, sig):
-            baseline = sig_resolver.resolve_baseline(call.package_name, call.method_name)
-        all_findings.extend(rule_engine.evaluate(call, sig, baseline))
-    all_findings = suppress_consequences(all_findings)
-
     # 6. Report Generation
-    Reporter().report(all_findings, json_path=json_report)
+    Reporter().report(all_findings, json_path=json_report, sarif_path=sarif)
     
     # 7. CI/CD Exit Code Enforcement
     has_breaking_changes = any(f.severity == "ERROR" for f in all_findings)
     if has_breaking_changes:
         console.print("\n[bold red]Build Failed:[/bold red] Incompatible API calls detected in target version.")
         raise typer.Exit(code=EXIT_BREAKING)
+
+@app.command()
+def outdated(
+    only: List[str] = typer.Option(
+        None, "--only", help="Only check these packages (repeat the option for several)."
+    ),
+    details: bool = typer.Option(False, "--details", help="Also print every finding for each package."),
+    json_report: str = typer.Option(
+        None, "--json-report", help="Also write all findings to this JSON file (for CI)."
+    ),
+    sarif: str = typer.Option(
+        None, "--sarif", help="Also write a SARIF file, for GitHub code scanning."
+    ),
+):
+    """
+    Check every outdated dependency at once: which upgrades are safe for your code, and which break it.
+
+    For each declared dependency with a newer release on PyPI, runs the same check as `upgrade`
+    against the latest version and prints one summary table.
+    """
+    console.print("[bold blue]Checking your outdated dependencies...[/bold blue]")
+    project_python = EnvironmentDetector(".").find_python_executable()
+    declared = DependencyDeclarationResolver(".").declared()
+    if only:
+        wanted = {normalize_name(o) for o in only}
+        declared = {name: spec for name, spec in declared.items() if normalize_name(name) in wanted}
+    if not declared:
+        console.print("[bold red]❌ Error:[/bold red] No dependencies found in requirements.txt or pyproject.toml.")
+        raise typer.Exit(code=EXIT_TOOL_ERROR)
+
+    py_files, _ = ProjectScanner(".").scan()
+    all_calls = ASTAnalyzer(py_files, root=Path(".")).analyze()
+    baseline_resolver = BaselineResolver(project_python)
+
+    rows, all_findings, per_package = [], [], {}
+    up_to_date = 0
+    for name in sorted(declared):
+        spec = declared[name]
+        with console.status(f"[dim]{name}: looking up versions...[/dim]"):
+            baseline = baseline_resolver.resolve(name, spec)
+            installed = baseline.installed_version
+            if baseline.status == BaselineStatus.NOT_INSTALLED:
+                rows.append((name, "-", "-", "-", "[yellow]skipped: not installed[/yellow]"))
+                continue
+            if baseline.status != BaselineStatus.MATCH:
+                rows.append((name, installed or "-", "-", "-",
+                             "[yellow]skipped: installed version does not match the declaration[/yellow]"))
+                continue
+            latest = latest_release(name)
+        if latest is None:
+            rows.append((name, installed, "?", "-", "[yellow]skipped: PyPI lookup failed[/yellow]"))
+            continue
+        try:
+            newer = Version(latest) > Version(installed)
+        except InvalidVersion:
+            newer = latest != installed
+        if not newer:
+            up_to_date += 1
+            continue
+
+        modules = set(importnames.import_names(project_python, name))
+        calls = [c for c in all_calls if c.package_name in modules]
+        if not calls:
+            rows.append((name, installed, latest, "0", "[green]✓ safe (not used in your code)[/green]"))
+            continue
+
+        with console.status(f"[dim]{name}: checking {len(calls)} call(s) against {latest}...[/dim]"):
+            try:
+                findings = check_calls(name, latest, None, project_python, calls)
+            except SandboxError as e:
+                first_line = str(e).splitlines()[0] if str(e) else "sandbox failed"
+                rows.append((name, installed, latest, str(len(calls)), f"[yellow]skipped: {escape(first_line)}[/yellow]"))
+                continue
+        errors = sum(1 for f in findings if f.severity == "ERROR")
+        warnings = sum(1 for f in findings if f.severity == "WARNING")
+        if errors:
+            result = f"[bold red]❌ {errors} breaking[/bold red]" + (f", {warnings} warning(s)" if warnings else "")
+        elif warnings:
+            result = f"[yellow]⚠ safe, {warnings} warning(s)[/yellow]"
+        else:
+            result = "[green]✓ safe[/green]"
+        rows.append((name, installed, latest, str(len(calls)), result))
+        per_package[name] = findings
+        all_findings.extend(findings)
+
+    table = Table(title="Outdated dependencies", header_style="bold magenta")
+    for column in ("Package", "Installed", "Latest", "Calls", "Result"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*[str(c) if c.startswith("[") else escape(str(c)) for c in row])
+    if rows:
+        console.print(table)
+    console.print(f"[dim]{up_to_date} dependenc{'y is' if up_to_date == 1 else 'ies are'} already up to date.[/dim]")
+
+    if details:
+        for name, findings in per_package.items():
+            if findings:
+                console.print(f"\n[bold]{escape(name)}[/bold]")
+                Reporter().generate_console_report(findings, label=f"{name} upgrade")
+
+    Reporter().report(all_findings, label="Outdated check", json_path=json_report, sarif_path=sarif, quiet=True)
+    if any(f.severity == "ERROR" for f in all_findings):
+        console.print("\n[bold red]Some upgrades break your code.[/bold red] Run with --details, or "
+                      "`drift-check upgrade <package> --to <version>`, to see where.")
+        raise typer.Exit(code=EXIT_BREAKING)
+
 
 @app.command()
 def probe(
@@ -236,6 +359,9 @@ def probe(
     ),
     json_report: str = typer.Option(
         None, "--json-report", help="Also write the findings to this JSON file (for CI)."
+    ),
+    sarif: str = typer.Option(
+        None, "--sarif", help="Also write a SARIF file, for GitHub code scanning."
     ),
     offline: bool = typer.Option(
         False, "--offline", help="Check against built-in rules for known server changes. No API key, nothing sent."
@@ -267,7 +393,7 @@ def probe(
             raise typer.Exit(code=EXIT_TOOL_ERROR)
         findings = probe_mod.offline_findings(call_sites, rule_list, model_override=model)
         console.print(f"[dim]Checked against {len(rule_list)} offline rule(s). Nothing was sent.[/dim]")
-        Reporter().report(findings, label="Offline rule check", json_path=json_report)
+        Reporter().report(findings, label="Offline rule check", json_path=json_report, sarif_path=sarif)
         if any(f.severity == "ERROR" for f in findings):
             console.print("\n[bold red]Build Failed:[/bold red] Calls match known server-side rejections.")
             raise typer.Exit(code=EXIT_BREAKING)
@@ -283,7 +409,7 @@ def probe(
     if not cases:
         reporter = Reporter()
         if findings:
-            reporter.report(findings, label="Server probe", json_path=json_report)
+            reporter.report(findings, label="Server probe", json_path=json_report, sarif_path=sarif)
         else:
             console.print("[green]✓ No chat.completions.create() calls found. Nothing to probe.[/green]")
         return
@@ -326,7 +452,7 @@ def probe(
                 raise typer.Exit(code=EXIT_TOOL_ERROR)
             findings.extend(probe_mod.findings_for(sent_case, result))
 
-    Reporter().report(findings, label="Server probe", json_path=json_report)
+    Reporter().report(findings, label="Server probe", json_path=json_report, sarif_path=sarif)
     if any(f.severity == "ERROR" for f in findings):
         console.print("\n[bold red]Build Failed:[/bold red] The server rejects calls made by this code.")
         raise typer.Exit(code=EXIT_BREAKING)
@@ -338,6 +464,9 @@ def typecheck(
     to_version: str = typer.Option(..., "--to", help="Target version to check against"),
     local_wheel: str = typer.Option(None, "--local-wheel", help="Local wheel to use instead of PyPI"),
     json_report: str = typer.Option(None, "--json-report", help="Also write the findings to this JSON file."),
+    sarif: str = typer.Option(
+        None, "--sarif", help="Also write a SARIF file, for GitHub code scanning."
+    ),
 ):
     """
     Type-check your project before and after the upgrade, and report only NEW type errors.
@@ -363,7 +492,7 @@ def typecheck(
         if sandbox:
             sandbox.cleanup()
 
-    Reporter().report(findings, label="Type-check diff", json_path=json_report)
+    Reporter().report(findings, label="Type-check diff", json_path=json_report, sarif_path=sarif)
     if any(f.severity == "ERROR" for f in findings):
         console.print("\n[bold red]Build Failed:[/bold red] The upgrade introduces new type errors.")
         raise typer.Exit(code=EXIT_BREAKING)
@@ -380,6 +509,9 @@ def test_command(
         help="Also list calls into the package that no test runs."
     ),
     json_report: str = typer.Option(None, "--json-report", help="Also write the findings to this JSON file."),
+    sarif: str = typer.Option(
+        None, "--sarif", help="Also write a SARIF file, for GitHub code scanning."
+    ),
 ):
     """
     Run your tests with the upgraded package and compare with today.
@@ -425,14 +557,12 @@ def test_command(
 
     call_sites = []
     if coverage_risk:
-        py_files, _ = ProjectScanner(".").scan()
-        call_sites = [c for c in ASTAnalyzer(py_files, root=Path(".")).analyze()
-                      if normalize_name(c.package_name) == normalize_name(package)]
+        _, call_sites = collect_call_sites(package, project_python)
 
     console.print(f"[dim]{target_run.total} test(s) run with the upgraded version"
                   + (f", {baseline_run.total} with your current version." if baseline_run else ".") + "[/dim]")
     findings = testrun.build_findings(package, baseline_run, target_run, root, call_sites, executed)
-    Reporter().report(findings, label="Test run", json_path=json_report)
+    Reporter().report(findings, label="Test run", json_path=json_report, sarif_path=sarif)
     if any(f.severity == "ERROR" for f in findings):
         console.print("\n[bold red]Build Failed:[/bold red] Tests break with the upgraded version.")
         raise typer.Exit(code=EXIT_BREAKING)

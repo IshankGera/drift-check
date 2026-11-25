@@ -103,3 +103,25 @@ class PyPIResolver:
         else:
             console.print("[dim]Operation cancelled by user.[/dim]")
             raise typer.Exit(code=2)
+
+def latest_release(package_name: str, timeout: float = 30.0):
+    """Latest stable version on PyPI, or None if it cannot be looked up (no prompts, no exits)."""
+    url = f"https://pypi.org/pypi/{package_name}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            data = json.loads(response.read().decode())
+    except Exception:
+        return None
+    candidates = []
+    for version, files in data.get("releases", {}).items():
+        try:
+            v = Version(version)
+        except InvalidVersion:
+            continue
+        if v.is_prerelease or v.is_devrelease:
+            continue
+        # Skip releases whose files were all yanked (or that have no files)
+        if not files or all(f.get("yanked") for f in files):
+            continue
+        candidates.append((v, version))
+    return max(candidates)[1] if candidates else None

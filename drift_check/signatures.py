@@ -588,15 +588,8 @@ class SignatureResolver:
         """Signature in the TARGET version (the sandbox)."""
         key = ("target", package_name, method_name)
         if key not in self._cache:
-            target_exec = (
-                self.sandbox_python_exec
-                if (
-                    self.sandbox_dir
-                    and package_name.replace("-", "_").lower()
-                    == self.package_to_sandbox.replace("-", "_").lower()
-                )
-                else self.project_python_exec
-            )
+            # Only calls into the upgraded package are resolved, so the sandbox is always the target
+            target_exec = self.sandbox_python_exec if self.sandbox_dir else self.project_python_exec
             self._cache[key] = self._resolve_with(target_exec, package_name, method_name)
         return self._cache[key]
 

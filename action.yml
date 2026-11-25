@@ -64,7 +64,7 @@ runs:
           ver="${line#*==}"
           echo "::group::drift-check upgrade $pkg --to $ver"
           rc=0
-          drift-check upgrade "$pkg" --to "$ver" --json-report "drift-check-$pkg.json" || rc=$?
+          drift-check upgrade "$pkg" --to "$ver" --json-report "drift-check-$pkg.json" --sarif "drift-check-$pkg.sarif" || rc=$?
           echo "::endgroup::"
           # Breaking changes (1) outrank setup errors (2) in the final result
           if [ "$rc" -eq 1 ]; then overall=1

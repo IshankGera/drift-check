@@ -58,13 +58,61 @@ class Reporter:
                 f"{warnings} warning(s).[/bold yellow]"
             )
 
-    def report(self, findings: List[Finding], label: str = "Upgrade analysis", json_path: Optional[str] = None):
-        """Console table, plus GitHub annotations in Actions, plus an optional JSON file."""
-        self.generate_console_report(findings, label=label)
-        if os.environ.get("GITHUB_ACTIONS") == "true":
-            self.github_annotations(findings)
+    def report(self, findings: List[Finding], label: str = "Upgrade analysis", json_path: Optional[str] = None,
+               sarif_path: Optional[str] = None, quiet: bool = False):
+        """Console table, GitHub annotations in Actions, and optional JSON / SARIF files."""
+        if not quiet:
+            self.generate_console_report(findings, label=label)
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                self.github_annotations(findings)
         if json_path:
             self.generate_json_report(findings, json_path, label=label)
+        if sarif_path:
+            self.generate_sarif_report(findings, sarif_path)
+
+    def generate_sarif_report(self, findings: List[Finding], output_path: str):
+        """SARIF 2.1.0, the format GitHub code scanning (and most CI tools) read."""
+        root = os.environ.get("GITHUB_WORKSPACE") or os.getcwd()
+        rules, results = {}, []
+        for f in findings:
+            rule_id, description = rule_for(f)
+            rules.setdefault(rule_id, description)
+            file_part = f.file_path.split("::")[0]
+            try:
+                uri = os.path.relpath(file_part, root) if os.path.isabs(file_part) else file_part
+            except ValueError:
+                uri = file_part
+            results.append({
+                "ruleId": rule_id,
+                "level": "error" if f.severity == "ERROR" else "warning",
+                "message": {"text": f.message if "::" not in f.file_path else f"{f.file_path}: {f.message}"},
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": uri.replace(os.sep, "/"), "uriBaseId": "%SRCROOT%"},
+                        "region": {"startLine": max(1, f.line_number)},
+                    }
+                }],
+                "partialFingerprints": {"driftCheck/v1": f"{rule_id}:{uri}:{f.package_name}:{f.method_name}"},
+            })
+        sarif = {
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {"driver": {
+                    "name": "drift-check",
+                    "version": _version(),
+                    "informationUri": "https://github.com/IshankGera/drift-check",
+                    "rules": [
+                        {"id": rid, "name": rid, "shortDescription": {"text": text}}
+                        for rid, text in sorted(rules.items())
+                    ],
+                }},
+                "results": results,
+            }],
+        }
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump(sarif, fh, indent=2)
+        self.console.print(f"[dim]SARIF report saved to {output_path}[/dim]")
 
     def github_annotations(self, findings: List[Finding]):
         """
@@ -113,3 +161,34 @@ def _escape_data(value: str) -> str:
 
 def _escape_property(value: str) -> str:
     return _escape_data(value).replace(":", "%3A").replace(",", "%2C")
+
+
+# (message prefix or fragment, rule id, description) - first match wins
+_RULES = [
+    ("Import '", "removed-import", "An imported name no longer exists in the target version"),
+    ("Method '", "removed-api", "A function, class or method no longer exists in the target version"),
+    ("is no longer supported", "removed-parameter", "A keyword argument is no longer accepted"),
+    ("Required parameter", "missing-required-argument", "A parameter became required"),
+    ("positional argument", "too-many-positional", "Fewer positional arguments are accepted"),
+    ("Deprecat", "deprecated-api", "The API is deprecated in the target version"),
+    ("New type error", "new-type-error", "The upgrade introduces a type error"),
+    ("Test fails", "test-failure", "A test fails with the upgraded version"),
+    ("Coverage risk", "untested-call", "A call into the package is not executed by any test"),
+    ("Server (", "server-rejection", "The API server rejects the call"),
+    ("offline rule", "known-server-rule", "The call matches a known server-side rejection"),
+]
+
+
+def rule_for(f: Finding):
+    for fragment, rule_id, description in _RULES:
+        if fragment in f.message:
+            return rule_id, description
+    return "unverifiable", "The call could not be verified against the target version"
+
+
+def _version() -> str:
+    try:
+        import importlib.metadata
+        return importlib.metadata.version("py-drift-check")
+    except Exception:
+        return "0"

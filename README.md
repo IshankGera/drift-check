@@ -20,11 +20,12 @@ pip install py-drift-check        # or with pip
 
 `uv` is installed automatically and is used to build the sandboxes.
 
-## 🧭 Four checks, from fastest to deepest
+## 🧭 Checks, from fastest to deepest
 
 | Command | What it checks | Needs |
 |---|---|---|
 | `drift-check upgrade` | Your calls against the new version's API: removed methods and imports, removed/renamed keyword arguments, new required arguments, positional-argument changes, deprecations | Nothing extra. Fast, never runs your code |
+| `drift-check outdated` | Every dependency with a newer release, in one run: which upgrades are safe for your code and which break it | Nothing extra |
 | `drift-check typecheck` | Runs a type checker before and after the upgrade and reports **only new** type errors. Catches cases the call check cannot see, such as methods on your own subclasses of the package's classes | Your project's dependencies (copied into a sandbox) |
 | `drift-check test` | Runs your tests with the new version and compares with today: newly failing tests, new deprecation warnings, and calls into the package that **no test runs** | `pytest` tests |
 | `drift-check probe` | Optional add-on for LLM apps: checks `chat.completions.create()` calls against the provider's server, or against built-in rules with `--offline` | An API key, except with `--offline` |
@@ -42,6 +43,7 @@ All commands share the same exit codes, so they drop straight into CI:
 Run from your project folder, with its virtual environment present (`.venv`, `venv`, `env`, or an activated one). To point at a different interpreter, set `DRIFT_CHECK_PYTHON=/path/to/python`.
 
 ```bash
+drift-check outdated
 drift-check upgrade openai --to 2.0.0
 drift-check typecheck pydantic --to 2.9.2
 drift-check test openai --to 2.0.0 --pytest-args "tests/unit"
@@ -56,13 +58,25 @@ drift-check upgrade my-sdk --to 2.0.0 --local-wheel ./dist/my_sdk-2.0.0-py3-none
 
 The baseline (your current version) is read from `requirements.txt`, `pyproject.toml` (`[project]` dependencies, optional dependencies and `[dependency-groups]`), or `uv.lock`, and must match what is installed.
 
+## 📋 `outdated`: every upgrade at once
+
+```text
+┃ Package  ┃ Installed ┃ Latest ┃ Calls ┃ Result                         ┃
+│ openai   │ 0.28.0    │ 3.59.0 │ 1     │ ❌ 1 breaking                  │
+│ pydantic │ 1.10.13   │ 2.14.4 │ 2     │ ⚠ safe, 1 warning(s)           │
+│ requests │ 2.32.5    │ 2.34.2 │ 0     │ ✓ safe (not used in your code) │
+```
+
+Checks every declared dependency against its latest stable release. `--only NAME` limits it to some packages, and `--details` prints every finding. Exits `1` if any upgrade breaks your code.
+
 ## 🔬 `upgrade`: how it works
 
 1. **Baseline check:** confirms the installed version matches your declared dependency.
-2. **AST scan:** reads your code without running it and records every call into the package: module functions, `from pkg import fn` imports, aliased and deep imports, constructors, and client objects (`client = OpenAI()`, `self.client`, clients imported from another module, and chained calls).
-3. **Sandbox:** installs the target version into a temporary virtual environment with `uv`.
-4. **Signature check:** inspects the real signatures in the sandbox, following type hints through chains like `client.chat.completions.create`, including lazily imported types.
-5. **Compare with today:** argument problems are reported only if your current version accepts the call and the new one does not, so nothing that is already broken (or misread) shows up as noise.
+2. **Import names:** finds the modules the package provides from its own metadata, so `pyyaml` is matched to `import yaml`, `pillow` to `PIL`, `beautifulsoup4` to `bs4`, and so on.
+3. **AST scan:** reads your code without running it and records every call into the package: module functions, `from pkg import fn` imports, aliased and deep imports, constructors, and client objects (`client = OpenAI()`, `self.client`, clients imported from another module, and chained calls).
+4. **Sandbox:** installs the target version into a temporary virtual environment with `uv`.
+5. **Signature check:** inspects the real signatures in the sandbox, following type hints through chains like `client.chat.completions.create`, including lazily imported types.
+6. **Compare with today:** argument problems are reported only if your current version accepts the call and the new one does not, so nothing that is already broken (or misread) shows up as noise.
 
 ```text
 │ ❌ ERROR │ app.py:1 │ mock_sdk │ Import 'old_method' from 'mock_sdk' no longer exists in the target version.
@@ -76,7 +90,7 @@ The baseline (your current version) is read from `requirements.txt`, `pyproject.
 `action.yml` in this repository is a ready-made GitHub Action. It checks one or more `name==version` upgrades, fails the job on breaking changes, and shows findings as inline annotations on the pull request.
 
 ```yaml
-- uses: IshankGera/drift-check@v0.4.0
+- uses: IshankGera/drift-check@v0.5.0
   with:
     updates: |
       openai==2.0.0
@@ -85,7 +99,20 @@ The baseline (your current version) is read from `requirements.txt`, `pyproject.
 
 [`examples/dependabot-drift-check.yml`](examples/dependabot-drift-check.yml) is a complete workflow for Dependabot pull requests. It installs the **old** versions as the baseline and checks your code against the **new** ones.
 
-Every command also accepts `--json-report report.json`. Inside GitHub Actions, findings are printed as `::error` / `::warning` annotations automatically.
+Every command also accepts `--json-report report.json` and `--sarif report.sarif`. Inside GitHub Actions, findings are printed as `::error` / `::warning` annotations automatically.
+
+To see findings in the repository's **Security → Code scanning** tab, upload the SARIF files the Action writes:
+
+```yaml
+- uses: IshankGera/drift-check@v0.5.0
+  with:
+    updates: openai==2.0.0
+- uses: github/codeql-action/upload-sarif@v3
+  if: always()
+  with:
+    sarif_file: .
+    category: drift-check
+```
 
 ## 🌐 `probe`: server-side checks for LLM apps (optional)
 
@@ -112,7 +139,6 @@ This tool is an alpha.
 * **Objects passed around:** clients passed in as function arguments or returned from functions are not traced by `upgrade` (`typecheck` covers them).
 * **Behaviour changes:** a function that keeps its signature but behaves differently is only caught by `test`.
 * **Deprecations:** detected from `@deprecated` markers and unconditional `warnings.warn(..., DeprecationWarning)` calls. Warnings raised only for some arguments are not reported by `upgrade` (they show up in `test`).
-* **Import names:** the package name must match its import name (e.g. `openai`, `stripe`). Packages like `pyyaml` → `yaml` are not mapped yet.
 
 ## License
 

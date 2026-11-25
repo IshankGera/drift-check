@@ -1,6 +1,6 @@
 [project]
 name = "py-drift-check"
-version = "0.4.1"
+version = "0.5.0"
 description = "Know which lines of your Python code a dependency upgrade will break, before you upgrade: call-site checks, type-check diff, test diff, and an optional LLM server probe."
 readme = "README.md"
 requires-python = ">=3.9"
